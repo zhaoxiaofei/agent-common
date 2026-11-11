@@ -74,6 +74,11 @@ def finish_reason_error(finish_reason: object, max_tokens: int) -> str:
     ``length`` is a max_tokens prefix and every unknown reason is a partial
     answer the provider refused to finish; neither may be returned as success.
     """
+    if finish_reason is not None and not isinstance(finish_reason, str):
+        return (
+            "the chat completion did not finish normally "
+            "(finish_reason=%r): the answer is incomplete" % (finish_reason,)
+        )
     if finish_reason == "length":
         return (
             "the chat completion was truncated (finish_reason='length', "

@@ -61,6 +61,11 @@ class ResponseTests(unittest.TestCase):
         for reason in (None, "stop", "end_turn", "stop_sequence", "tool_calls"):
             self.assertEqual(finish_reason_error(reason, 99), "")
 
+    def test_a_non_string_finish_reason_is_a_controlled_error(self):
+        self.assertIn(
+            "did not finish normally", finish_reason_error(["length"], 99)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

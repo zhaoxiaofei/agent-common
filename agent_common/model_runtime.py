@@ -283,6 +283,17 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
 #: numbers.
 _apply_model_catalog(AGENT_MODELS)
 
+
+def reload_model_catalog() -> None:
+    """Re-read and apply the catalog with the current policy flags.
+
+    Import-time validation uses the shared defaults.  A checkout whose policy
+    differs (GDP and paper-refine-eval fail closed on a missing catalog) sets
+    the flag and calls this immediately, so the policy is not silently lost.
+    """
+    _apply_model_catalog(AGENT_MODELS)
+
+
 AGENT_MODEL_CHOICES: Tuple[str, ...] = tuple(AGENT_MODELS) + (MODEL_DEFAULT,)
 
 #: Capacity numbers resolved from the shared catalog (authoritative).
