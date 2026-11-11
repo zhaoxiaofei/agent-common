@@ -39,17 +39,44 @@ class DefaultReasoningLevelTests(unittest.TestCase):
         return model_runtime.resolve_agent_selection(harness=harness, model=model)
 
     def test_the_catalog_records_the_documented_defaults(self):
-        self.assertEqual(model_runtime.DEEPSEEK_DEFAULT_EFFORT, "max")
+        self.assertEqual(model_runtime.DEEPSEEK_DEFAULT_EFFORT, "high")
         self.assertEqual(model_runtime.DOTS_DEFAULT_EFFORT, "high")
         self.assertEqual(model_runtime.QWEN_DEFAULT_EFFORT, "medium")
         self.assertEqual(
-            model_runtime.default_reasoning_level("deepseek-flash"), "max"
+            model_runtime.default_reasoning_level("deepseek-flash"), "high"
         )
         self.assertEqual(
             model_runtime.default_reasoning_level("dots3-note-preview"), "high"
         )
         self.assertEqual(
             model_runtime.default_reasoning_level("qwen38-27b"), "medium"
+        )
+
+    def test_the_catalog_facts_are_read_through_one_helper(self):
+        # Context length, harness cap, chat cap and reasoning level come from
+        # the catalog, so a consumer never hard-codes one of them.
+        self.assertEqual(
+            model_runtime.model_fact("qwen38-27b", "context_window"), 150000
+        )
+        self.assertEqual(model_runtime.model_fact("qwen38-27b", "max_tokens"), 32768)
+        self.assertEqual(
+            model_runtime.model_fact("qwen38-27b", "chat_max_tokens"),
+            model_runtime.QWEN_CHAT_MAX_TOKENS,
+        )
+        self.assertEqual(
+            model_runtime.model_fact("dots3-note-preview", "context_window"),
+            model_runtime.DOTS_CONTEXT_WINDOW,
+        )
+        self.assertEqual(
+            model_runtime.model_fact("dots3-note-preview", "chat_max_tokens"),
+            model_runtime.DOTS_CHAT_MAX_TOKENS,
+        )
+        self.assertEqual(
+            model_runtime.model_fact("deepseek-flash", "default_reasoning_level"),
+            "high",
+        )
+        self.assertEqual(
+            model_runtime.model_fact("unknown-model", "context_window", 7), 7
         )
 
     def test_a_model_that_keeps_its_own_default_has_no_catalog_level(self):
@@ -62,7 +89,7 @@ class DefaultReasoningLevelTests(unittest.TestCase):
 
     def test_the_dsh_patch_writes_the_catalog_level(self):
         deepseek = model_runtime.dsh_patch_text(self.selection("deepseek-flash"))
-        self.assertIn('reasoningEffort: "max"', deepseek)
+        self.assertIn('reasoningEffort: "high"', deepseek)
         dots = model_runtime.dsh_patch_text(self.selection("dots3-note-preview"))
         self.assertIn("              high: max", dots)
         self.assertIn('    reasoningEffort: "high"', dots)
@@ -76,7 +103,7 @@ class DefaultReasoningLevelTests(unittest.TestCase):
 
     def test_the_codex_route_passes_the_same_defaults(self):
         deepseek = model_runtime.codex_provider_args(self.selection("deepseek-flash"))
-        self.assertIn('model_reasoning_effort="max"', deepseek)
+        self.assertIn('model_reasoning_effort="high"', deepseek)
         dots = model_runtime.codex_provider_args(
             self.selection("dots3-note-preview")
         )
@@ -90,13 +117,13 @@ class DefaultReasoningLevelTests(unittest.TestCase):
 
     def test_the_operator_override_still_wins(self):
         patch = model_runtime.dsh_patch_text(
-            self.selection("deepseek-flash"), effort_override="high"
+            self.selection("deepseek-flash"), effort_override="low"
         )
-        self.assertIn('reasoningEffort: "high"', patch)
+        self.assertIn('reasoningEffort: "low"', patch)
 
     def test_claude_code_gets_the_deepseek_default_only(self):
         env = model_runtime.claude_environment(self.selection("deepseek-flash"))
-        self.assertEqual(env["CLAUDE_CODE_EFFORT_LEVEL"], "max")
+        self.assertEqual(env["CLAUDE_CODE_EFFORT_LEVEL"], "high")
         # GPT and Claude keep their own effort: no override is exported.
         self.assertEqual(
             model_runtime.claude_environment(self.selection("claude-opus")), {}

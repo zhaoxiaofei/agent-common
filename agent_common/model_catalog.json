@@ -5,7 +5,7 @@
     "Canonical model facts for the gdp, paper-refine and paper-refine-eval checkouts.",
     "The canonical file lives in repos/agent-common/agent_common/model_catalog.json; each checkout carries an identical copy.",
     "context_window is the window the deployment enforces (not necessarily the advertised one); max_tokens is the per-response output cap, which must leave room for the prompt.",
-    "max_tokens is the per-response cap for a harnessed agent and chat_max_tokens is the cap for one direct completion. Both assume the model always reasons: the reasoning trace counts toward the completion, so chat_max_tokens covers reasoning plus the answer. Reasoning effort is a per-run policy: default_reasoning_level records the level a deployment serves when the operator sets no override, and every harness reads that field as its default while an operator override still wins. It is present on deepseek-flash (max), dots3-note-prev (high) and qwen3.8-27b (medium). The GPT and Claude entries omit it deliberately: those deployments keep the model's own default and the generated configuration sends no reasoning-effort field at all.",
+    "max_tokens is the per-response cap for a harnessed agent and chat_max_tokens is the cap for one direct completion. Both assume the model always reasons: the reasoning trace counts toward the completion, so chat_max_tokens covers reasoning plus the answer. Reasoning effort is a per-run policy: default_reasoning_level records the level a deployment serves when the operator sets no override, and every harness reads that field as its default while an operator override still wins. It is present on deepseek-flash (high), dots3-note-prev (high) and qwen3.8-27b (medium). The GPT and Claude entries omit it deliberately: those deployments keep the model's own default and the generated configuration sends no reasoning-effort field at all.",
     "Every model carries verified_at (the date the numbers were re-checked) and source (where each number comes from); update both with the numbers."
   ],
   "models": [
@@ -16,13 +16,13 @@
       "context_window": 1048576,
       "max_tokens": 384000,
       "chat_max_tokens": 384000,
-      "default_reasoning_level": "max",
+      "default_reasoning_level": "high",
       "verified_at": "2026-11-10",
       "source": [
         "https://api-docs.deepseek.com/quick_start/pricing \u2014 official model table: id deepseek-flash, CONTEXT LENGTH 1M, MAX OUTPUT 384K.",
         "DSH adapter dsh-llm-deepseek/lib/index.js (OFFICIAL_CONTEXT_WINDOW=1048576) records the official /models listing's 1,048,576-token window."
       ],
-      "notes": "default_reasoning_level is max, not the high the DeepSeek adapter serves when a request names no effort: the generated DSH patch names reasoningEffort=max, the Codex route passes model_reasoning_effort=max, and the Claude Code route sets CLAUDE_CODE_EFFORT_LEVEL=max. The adapter's own levels are off, low, high and max."
+      "notes": "default_reasoning_level is high, the same level the DeepSeek adapter serves when a request names no effort; the generated DSH patch, the Codex route and the Claude Code environment name it explicitly so the policy is not an accident of the adapter default. The adapter's own levels are off, low, high and max."
     },
     {
       "name": "gpt-sol",

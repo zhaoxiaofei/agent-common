@@ -31,6 +31,7 @@ from gdp.agent_models import (
 )
 out = {}
 for name, base_url in (
+    ("deepseek-flash", ""),
     ("qwen38-27b", QWEN_DEFAULT_BASE_URL),
     ("dots3-note-preview", DOTS_DEFAULT_BASE_URL),
 ):
@@ -38,8 +39,10 @@ for name, base_url in (
     out[entry["id"]] = {
         "context_window": entry["context_window"],
         "max_tokens": entry["max_tokens"],
-        "base_url": base_url,
+        "chat_max_tokens": entry["chat_max_tokens"],
     }
+    if base_url:
+        out[entry["id"]]["base_url"] = base_url
     if entry.get("default_reasoning_level"):
         out[entry["id"]]["default_reasoning_level"] = entry["default_reasoning_level"]
 print(json.dumps(out))
@@ -59,6 +62,11 @@ print(json.dumps({
     "dots3-note-prev": {
         "context_window": llm.DEFAULT_DOTS_MAX_CONTEXT,
         "base_url": llm.DEFAULT_DOTS_BASE_URL,
+        "default_reasoning_level": llm.MODEL_CAPACITIES["dots3-note-prev"]["reasoning_effort"],
+    },
+    "deepseek-flash": {
+        "context_window": llm.DEFAULT_DEEPSEEK_MAX_CONTEXT,
+        "default_reasoning_level": llm.DEFAULT_DEEPSEEK_REASONING_EFFORT,
     },
 }))
 """
@@ -80,6 +88,7 @@ print(json.dumps({
         "max_tokens": dots.DEFAULT_MAX_TOKENS,
         "chat_max_tokens": dots.DEFAULT_CHAT_MAX_TOKENS,
         "base_url": dots.DEFAULT_BASE_URL,
+        "default_reasoning_level": dots.DEFAULT_EFFORT,
     },
 }))
 """

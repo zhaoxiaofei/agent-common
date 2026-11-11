@@ -35,6 +35,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 if __package__:
     from .llm_retry import (
+        DOTS_WIRE_EFFORT,
         RetrySchedule,
         dots_compaction,
         dots_dsh_overlay,
@@ -45,6 +46,7 @@ if __package__:
     )
 else:  # pragma: no cover - a paper-refine frozen root has no package
     from llm_retry import (  # type: ignore
+        DOTS_WIRE_EFFORT,
         RetrySchedule,
         dots_compaction,
         dots_dsh_overlay,
@@ -156,6 +158,7 @@ AGENT_MODELS: Dict[str, Dict[str, Any]] = {
         "dsh_provider": "deepseek-official",
         "context_window": 1048576,
         "max_tokens": 384000,
+        "chat_max_tokens": 384000,
     },
     "gpt-sol": {
         "label": "GPT Sol",
@@ -166,6 +169,7 @@ AGENT_MODELS: Dict[str, Dict[str, Any]] = {
         "dsh_provider": "openai",
         "context_window": 1050000,
         "max_tokens": 128000,
+        "chat_max_tokens": 128000,
     },
     "gpt-terra": {
         "label": "GPT Terra",
@@ -176,6 +180,7 @@ AGENT_MODELS: Dict[str, Dict[str, Any]] = {
         "dsh_provider": "openai",
         "context_window": 1050000,
         "max_tokens": 128000,
+        "chat_max_tokens": 128000,
     },
     "claude-opus": {
         "label": "Claude Opus",
@@ -187,6 +192,7 @@ AGENT_MODELS: Dict[str, Dict[str, Any]] = {
         "dsh_provider": "anthropic",
         "context_window": 1000000,
         "max_tokens": 128000,
+        "chat_max_tokens": 128000,
     },
     "claude-sonnet": {
         "label": "Claude Sonnet",
@@ -198,6 +204,7 @@ AGENT_MODELS: Dict[str, Dict[str, Any]] = {
         "dsh_provider": "anthropic",
         "context_window": 1000000,
         "max_tokens": 128000,
+        "chat_max_tokens": 128000,
     },
     "qwen38-27b": {
         "label": "Qwen3.8-27B",
@@ -212,6 +219,7 @@ AGENT_MODELS: Dict[str, Dict[str, Any]] = {
         "dsh_provider": "qwen",
         "context_window": 150000,
         "max_tokens": 32768,
+        "chat_max_tokens": 80000,
     },
     "dots3-note-preview": {
         "label": "Dots3 Note Preview",
@@ -226,18 +234,20 @@ AGENT_MODELS: Dict[str, Dict[str, Any]] = {
         "dsh_provider": "dots",
         "context_window": 393000,
         "max_tokens": 65536,
+        "chat_max_tokens": 160000,
     },
 }
 
 #: The shared model catalog.  Its canonical copy lives in
-#: ``repos/common/model_catalog.json`` and every checkout carries an identical
-#: copy beside this module; only the two capacity numbers are read from it.
-#: Labels, aliases and the harness matrix stay in ``AGENT_MODELS``.
+#: ``repos/agent-common/agent_common/model_catalog.json`` and every checkout
+#: carries an identical copy beside this module; the capacity numbers and the
+#: default reasoning level are read from it.  Labels, aliases and the harness
+#: matrix stay in ``AGENT_MODELS``.
 _MODEL_CATALOG_PATH = Path(__file__).with_name("model_catalog.json")
 
 
 def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
-    """Overwrite each model's capacity from the shared catalog."""
+    """Overwrite each model's capacities and default level from the shared catalog."""
     try:
         with _MODEL_CATALOG_PATH.open(encoding="utf-8") as handle:
             document = json.load(handle)
@@ -259,6 +269,26 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
                 )
             entry["context_window"] = context_window
             entry["max_tokens"] = max_tokens
+            chat_max_tokens = facts.get("chat_max_tokens")
+            if chat_max_tokens is not None:
+                chat_max_tokens = int(chat_max_tokens)
+                if (
+                    chat_max_tokens <= 0
+                    or chat_max_tokens < max_tokens
+                    or chat_max_tokens >= context_window
+                ):
+                    raise ConfigError(
+                        "model %r: chat_max_tokens %d must be positive, at "
+                        "least max_tokens %d and below context_window %d in %s"
+                        % (
+                            name,
+                            chat_max_tokens,
+                            max_tokens,
+                            context_window,
+                            _MODEL_CATALOG_PATH,
+                        )
+                    )
+                entry["chat_max_tokens"] = chat_max_tokens
             default_level = facts.get("default_reasoning_level")
             if default_level:
                 entry["default_reasoning_level"] = str(default_level)
@@ -286,9 +316,9 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
         ) from exc
 
 
-#: ``context_window``/``max_tokens`` in the table above are placeholders: the
-#: catalog overlay replaces them at import, so edit the catalog, not those
-#: numbers.
+#: ``context_window``/``max_tokens``/``chat_max_tokens`` in the table above are
+#: placeholders: the catalog overlay replaces them at import, so edit the
+#: catalog, not those numbers.
 _apply_model_catalog(AGENT_MODELS)
 
 
@@ -315,10 +345,13 @@ AGENT_MODEL_CHOICES: Tuple[str, ...] = tuple(AGENT_MODELS) + (MODEL_DEFAULT,)
 #: Capacity numbers resolved from the shared catalog (authoritative).
 QWEN_CONTEXT_WINDOW = int(AGENT_MODELS["qwen38-27b"]["context_window"])
 QWEN_MAX_TOKENS = int(AGENT_MODELS["qwen38-27b"]["max_tokens"])
+QWEN_CHAT_MAX_TOKENS = int(AGENT_MODELS["qwen38-27b"]["chat_max_tokens"])
 DOTS_CONTEXT_WINDOW = int(AGENT_MODELS["dots3-note-preview"]["context_window"])
 DOTS_MAX_TOKENS = int(AGENT_MODELS["dots3-note-preview"]["max_tokens"])
+DOTS_CHAT_MAX_TOKENS = int(AGENT_MODELS["dots3-note-preview"]["chat_max_tokens"])
 DEEPSEEK_CONTEXT_WINDOW = int(AGENT_MODELS["deepseek-flash"]["context_window"])
 DEEPSEEK_MAX_TOKENS = int(AGENT_MODELS["deepseek-flash"]["max_tokens"])
+DEEPSEEK_CHAT_MAX_TOKENS = int(AGENT_MODELS["deepseek-flash"]["chat_max_tokens"])
 
 #: Per-request retry and compaction-key policy.  The canonical file lives in
 #: ``repos/agent-common/agent_common/llm_policy.json``; the submodule copy beside this module
@@ -388,7 +421,7 @@ DOTS_DEFAULT_EFFORT = str(
     AGENT_MODELS["dots3-note-preview"].get("default_reasoning_level") or "high"
 )
 DEEPSEEK_DEFAULT_EFFORT = str(
-    AGENT_MODELS["deepseek-flash"].get("default_reasoning_level") or "max"
+    AGENT_MODELS["deepseek-flash"].get("default_reasoning_level") or "high"
 )
 DOTS_DEFAULT_BASE_URL = "https://note3-prev-api.askdiandian.com/v1"
 DOTS_DEFAULT_MODEL = "dots3-note-prev"
@@ -601,6 +634,30 @@ def agent_model_label(model: Optional[str]) -> str:
     return "custom-endpoint" if agent_model_is_endpoint(model) else str(model)
 
 
+def model_fact(model: Any, field: str, default: Any = None) -> Any:
+    """One shared-catalog fact for a named model.
+
+    The catalog owns the numbers every consumer would otherwise duplicate: the
+    context window, the harness output cap (``max_tokens``), the single-shot
+    chat cap (``chat_max_tokens``) and ``default_reasoning_level``.  Read them
+    here so a catalog revision needs no change outside this repository.
+
+    Example:
+        ``model_fact("qwen38-27b", "context_window") == 150000`` and
+        ``model_fact("dots3-note-preview", "chat_max_tokens") == 160000``.
+
+    Counterexample:
+        An unknown model, the ``default`` sentinel or a custom endpoint returns
+        ``default``; it does not raise, so validate a name with
+        ``agent_model_choice`` first when a typo must be an error.
+    """
+    slug = normalize_agent_model(model)
+    if slug == MODEL_DEFAULT:
+        return default
+    value = (AGENT_MODELS.get(slug) or {}).get(field)
+    return default if value is None else value
+
+
 def default_reasoning_level(model: Any) -> Optional[str]:
     """The reasoning level a named model serves when no operator override is set.
 
@@ -621,10 +678,7 @@ def default_reasoning_level(model: Any) -> Optional[str]:
         substitute a literal for a model that keeps its own default, and do not
         call this for a custom endpoint URL.
     """
-    slug = normalize_agent_model(model)
-    if slug == MODEL_DEFAULT:
-        return None
-    level = (AGENT_MODELS.get(slug) or {}).get("default_reasoning_level")
+    level = model_fact(model, "default_reasoning_level")
     return str(level) if level else None
 
 

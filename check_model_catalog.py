@@ -5,7 +5,7 @@ Canonical file: ``repos/agent-common/agent_common/model_catalog.json``.  Each
 checkout mounts this repository as ``agent-common/``; run this after editing the catalog
 and committing it here.  It fails on a byte difference (a checkout's submodule
 drifted), an invalid capacity pair, or a `default_reasoning_level` that is not the
-documented policy (DeepSeek max, Dots high, Qwen medium; GPT and Claude carry no
+documented policy (DeepSeek and Dots high, Qwen medium; GPT and Claude carry no
 level so their own default applies).
 
     python3 repos/agent-common/check_model_catalog.py
@@ -31,7 +31,7 @@ COPIES = [
 #: catalog; a catalog edit that changes one of these is a policy change, not a
 #: capacity refresh, so the check pins it here.
 REASONING_DEFAULTS = {
-    "deepseek-flash": "max",
+    "deepseek-flash": "high",
     "dots3-note-prev": "high",
     "qwen3.8-27b": "medium",
 }

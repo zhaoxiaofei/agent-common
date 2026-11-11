@@ -806,7 +806,7 @@ _DOTS_THINKING_EFFORTS: Tuple[str, ...] = (
     "max",
 )
 _DOTS_THINKING_OFF = frozenset({"", "0", "false", "no", "none", "off"})
-_DOTS_WIRE_EFFORT = "max"
+DOTS_WIRE_EFFORT = "max"
 
 
 def dots_dsh_overlay(
@@ -882,7 +882,7 @@ def dots_dsh_overlay(
     if thinking:
         lines.append("            reasoningEfforts:")
         lines.extend(
-            "              %s: %s" % (level, _DOTS_WIRE_EFFORT) for level in levels
+            "              %s: %s" % (level, DOTS_WIRE_EFFORT) for level in levels
         )
     else:
         lines.append("            reasoningEfforts: false")

@@ -101,7 +101,7 @@ send a field those endpoints do not document.
 
 | Model | Default level | Where it is applied |
 | --- | --- | --- |
-| `deepseek-flash` | `max` | the DSH patch names `reasoningEffort: max` (the DeepSeek adapter would otherwise serve `high`), the Codex route passes `model_reasoning_effort=max`, and Claude Code gets `CLAUDE_CODE_EFFORT_LEVEL=max` |
+| `deepseek-flash` | `high` | the DSH patch names `reasoningEffort: high`, the Codex route passes `model_reasoning_effort=high`, and Claude Code gets `CLAUDE_CODE_EFFORT_LEVEL=high` |
 | `dots3-note-prev` | `high` | the Dots API exposes one thinking level; the DSH overlay declares every thinking level against the wire's `max` value and names `reasoningEffort: high`, and the Codex route passes `high` |
 | `qwen3.8-27b` | `medium` | the balanced level, not the wire's highest `xhigh`; the wire still accepts `low` and `xhigh` as overrides |
 | `gpt-6.1-sol` / `gpt-6.1-terra` | the model's own default | no `reasoningEffort` field is sent |
@@ -112,6 +112,16 @@ send a field those endpoints do not document.
 (`PAPER_DEEPSEEK_REASONING_EFFORT`, `PAPER_DOTS_REASONING_EFFORT` or
 `PAPER_QWEN_REASONING_EFFORT`) still wins; `none`/`off` turns Dots thinking
 off by disabling effort selection.
+
+**Every common model setting lives here.**  Context windows, the harness
+output cap, the single-shot chat cap, the default reasoning level, the base
+URLs and the model ids are defined in this repository, and a consumer reads
+them through `model_fact()`, the exported `QWEN_*`/`DOTS_*`/`DEEPSEEK_*`
+constants or `AGENT_MODELS` — never through its own copy.  Changing a value
+here is therefore a one-repository change: the gdp runtime, the paper-refine
+adapters and paper-refine-eval pick it up when their pinned submodule is
+advanced.  A literal that duplicates one of these values in a checkout is a
+bug; report it so it can be moved here.
 
 ## Verification
 
