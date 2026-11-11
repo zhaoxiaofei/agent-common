@@ -60,6 +60,14 @@ class ConfigError(Exception):
 
     The host repository replaces this class at import time (GDP aliases its
     ``gdp.errors.ConfigError``) so callers keep their own error hierarchy.
+
+    Example:
+        ``resolve_agent_selection(model="unknown")`` raises this error (or the
+        host's rebound subclass).
+
+    Counterexample:
+        Do not catch broad ``Exception`` around a resolution call; that also
+        hides transport and programming errors the caller must see.
     """
 
 # ---------------------------------------------------------------------------
@@ -701,7 +709,19 @@ def pair_from_options(
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class AgentSelection:
-    """One resolved (harness, model) choice plus its request-side settings."""
+    """One resolved (harness, model) choice plus its request-side settings.
+
+    The object is frozen: it is a value passed between the CLI, the adapter and
+    the run-record writer, not mutable state.
+
+    Example:
+        ``resolve_agent_selection(harness="dsh", model="gpt-sol")`` returns an
+        ``AgentSelection(harness="dsh", model="gpt-sol", ...)``.
+
+    Counterexample:
+        Do not assign ``selection.model = ...`` to retarget a run; create a new
+        selection through ``resolve_agent_selection`` so validation still runs.
+    """
 
     harness: str
     model: Optional[str] = None

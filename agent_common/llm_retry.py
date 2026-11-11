@@ -202,7 +202,16 @@ def policy_paths(*candidates: Optional[Any]) -> Optional[Path]:
 
 
 class RetrySchedule:
-    """The delay and retryable-failure policy for one process."""
+    """The delay and retryable-failure policy for one process.
+
+    Example:
+        ``RetrySchedule(load_policy()).delays()`` returns the documented
+        ``[10, 20, ..., 3600]`` schedule.
+
+    Counterexample:
+        ``RetrySchedule`` does not sleep; ``delay`` returns seconds.  Sleeping
+        is the proxy's/caller's responsibility.
+    """
 
     def __init__(self, policy: Optional[Mapping[str, Any]] = None):
         document = dict(policy or load_policy())
@@ -513,6 +522,14 @@ class RetryProxy:
     provider at this proxy restores per-call backoff there without touching the
     installed harness.  The proxy never stores or rewrites credentials: the
     ``Authorization``/``api-key`` headers DSH sends are forwarded unchanged.
+
+    Example:
+        ``proxy = RetryProxy("https://api.example/v1"); base = proxy.start()``
+        gives a loopback base URL to put in the provider patch.
+
+    Counterexample:
+        Do not use it as a general-purpose HTTP server: it only forwards to one
+        configured upstream and only retries the policy's statuses.
     """
 
     def __init__(
