@@ -3,9 +3,9 @@
   "updated_at": "2026-11-12",
   "notes": [
     "Canonical model facts for the gdp, paper-refine and paper-refine-eval checkouts.",
-    "The canonical file lives in repos/common/model_catalog.json; each checkout carries an identical copy.",
+    "The canonical file lives in repos/agent-common/agent_common/model_catalog.json; each checkout carries an identical copy.",
     "context_window is the window the deployment enforces (not necessarily the advertised one); max_tokens is the per-response output cap, which must leave room for the prompt.",
-    "max_tokens is the per-response cap for a harnessed agent and chat_max_tokens is the cap for one direct completion. Both assume the model always reasons: the reasoning trace counts toward the completion, so chat_max_tokens covers reasoning plus the answer. Reasoning effort is a per-run policy and is not stored here, with one exception: default_reasoning_level records the level a deployment serves by default (currently only qwen3.8-27b, at medium). Every harness reads that field as its default, and an operator override still wins.",
+    "max_tokens is the per-response cap for a harnessed agent and chat_max_tokens is the cap for one direct completion. Both assume the model always reasons: the reasoning trace counts toward the completion, so chat_max_tokens covers reasoning plus the answer. Reasoning effort is a per-run policy: default_reasoning_level records the level a deployment serves when the operator sets no override, and every harness reads that field as its default while an operator override still wins. It is present on deepseek-flash (max), dots3-note-prev (high) and qwen3.8-27b (medium). The GPT and Claude entries omit it deliberately: those deployments keep the model's own default and the generated configuration sends no reasoning-effort field at all.",
     "Every model carries verified_at (the date the numbers were re-checked) and source (where each number comes from); update both with the numbers."
   ],
   "models": [
@@ -16,11 +16,13 @@
       "context_window": 1048576,
       "max_tokens": 384000,
       "chat_max_tokens": 384000,
+      "default_reasoning_level": "max",
       "verified_at": "2026-11-10",
       "source": [
         "https://api-docs.deepseek.com/quick_start/pricing \u2014 official model table: id deepseek-flash, CONTEXT LENGTH 1M, MAX OUTPUT 384K.",
         "DSH adapter dsh-llm-deepseek/lib/index.js (OFFICIAL_CONTEXT_WINDOW=1048576) records the official /models listing's 1,048,576-token window."
-      ]
+      ],
+      "notes": "default_reasoning_level is max, not the high the DeepSeek adapter serves when a request names no effort: the generated DSH patch names reasoningEffort=max, the Codex route passes model_reasoning_effort=max, and the Claude Code route sets CLAUDE_CODE_EFFORT_LEVEL=max. The adapter's own levels are off, low, high and max."
     },
     {
       "name": "gpt-sol",
@@ -87,7 +89,7 @@
         "https://help.aliyun.com/en/model-studio/qwen3-8-27b \u2014 public model qwen3.8-27b: context window 1,000,000, max output 131,072.",
         "Local deployment: the server reports a 150,000-token window (paper-refine-eval/README.md); the catalog records the deployed window because every harness talks to that server."
       ],
-      "notes": "max_tokens 32,768 (harness) and chat_max_tokens 80,000 (single completion) are harness policies inside the deployed 150,000-token window; the public model allows 131,072 output tokens. default_reasoning_level is the level this deployment serves by default (medium, the balanced level); the wire also accepts low and xhigh, and an operator override still wins."
+      "notes": "max_tokens 32,768 (harness) and chat_max_tokens 80,000 (single completion) are harness policies inside the deployed 150,000-token window; the public model allows 131,072 output tokens. default_reasoning_level is the level this deployment serves by default (medium, the balanced level, not the wire's highest xhigh); the wire also accepts low and xhigh, and an operator override still wins."
     },
     {
       "name": "dots3-note-preview",
@@ -98,12 +100,13 @@
       "base_url": "https://note3-prev-api.askdiandian.com/v1",
       "api_key_env": "DOTS_API_KEY",
       "chat_max_tokens": 160000,
+      "default_reasoning_level": "high",
       "verified_at": "2026-11-10",
       "source": [
         "https://dots.ai/platform/docs \u2014 platform documentation; the page is JavaScript-only, so the advertised 512K window is taken from the operator's notes in these repos rather than read here.",
         "Enforced ceiling measured 2026-11-10: three gdp runs were rejected with HTTP 400 once prompt + max_tokens crossed 393,000 (traceIds 2f68..., ad38..., 43385...); the DSH headless profile declares contextWindow: 393000."
       ],
-      "notes": "512K is advertised, 393,000 is enforced; max_tokens 65,536 and chat_max_tokens 160,000 are harness policies."
+      "notes": "512K is advertised, 393,000 is enforced; max_tokens 65,536 and chat_max_tokens 160,000 are harness policies. default_reasoning_level is high, not the medium the shared runtime used to fall back to: the API exposes one thinking level, so the DSH overlay declares every thinking level against the wire's max value and none (or thinking off) is the only lower state."
     }
   ]
 }

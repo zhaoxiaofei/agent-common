@@ -42,6 +42,7 @@ Key entry points:
 | `claude_environment` / `claude_model_arg` | Point Claude Code at the selected provider. |
 | `selection_env` | Child-process credential environment (never persisted). |
 | `effective_agent_model` / `AgentSelection.to_record` | Secret-free run record. |
+| `default_reasoning_level` | The catalog default level for a named model (`None` when the model keeps its own default). |
 | `endpoint_base` / `endpoint_query_model` / `endpoint_credentials` | Parse and validate custom endpoints. |
 | `redact_endpoint_url` / `redact_prep_object` | Remove credentials from recorded artifacts. |
 | `start_prep_proxy` / `stop_prep_proxy` | Merge a prep object into outgoing requests. |
@@ -49,6 +50,23 @@ Key entry points:
 
 Counterexample: do not feed `AgentSelection.to_record()["model"]` back into a
 live request for a custom endpoint — it is redacted.  Keep the live selection.
+
+## `model_runtime` reasoning defaults
+
+`default_reasoning_level(model)` returns the level the shared catalog records
+as the deployment's default: `max` for `deepseek-flash`, `high` for
+`dots3-note-preview` and `medium` for `qwen38-27b`.  It returns `None` for
+GPT and Claude (their harness configuration sends no effort, so the model's own
+default applies) and for the `default` sentinel or a custom endpoint.
+
+`dsh_patch_text` and `codex_provider_args` already apply the value, so a
+consumer that only needs the number (for an adapter default, a log line or a
+documented table) should call this helper instead of hard-coding a literal.
+`PAPER_DEEPSEEK_REASONING_EFFORT`, `PAPER_DOTS_REASONING_EFFORT` and
+`PAPER_QWEN_REASONING_EFFORT` remain operator overrides.
+
+Counterexample: `default_reasoning_level("gpt-sol") is None` is not an error;
+substituting `"high"` for it would override the model's own default.
 
 Policy flags (set before the first real request):
 

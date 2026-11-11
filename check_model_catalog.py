@@ -4,7 +4,9 @@
 Canonical file: ``repos/agent-common/agent_common/model_catalog.json``.  Each
 checkout mounts this repository as ``agent-common/``; run this after editing the catalog
 and committing it here.  It fails on a byte difference (a checkout's submodule
-drifted) or an invalid capacity pair.
+drifted), an invalid capacity pair, or a `default_reasoning_level` that is not the
+documented policy (DeepSeek max, Dots high, Qwen medium; GPT and Claude carry no
+level so their own default applies).
 
     python3 repos/agent-common/check_model_catalog.py
 """
@@ -23,6 +25,24 @@ COPIES = [
     ROOT / "paper-refine-eval" / "agent-common" / "agent_common" / "model_catalog.json",
     ROOT / "paper-refine" / "agent-common" / "agent_common" / "model_catalog.json",
 ]
+
+#: The reasoning level each deployment serves when the operator sets no
+#: override.  This is the policy the runtime and every harness read from the
+#: catalog; a catalog edit that changes one of these is a policy change, not a
+#: capacity refresh, so the check pins it here.
+REASONING_DEFAULTS = {
+    "deepseek-flash": "max",
+    "dots3-note-prev": "high",
+    "qwen3.8-27b": "medium",
+}
+#: GPT and Claude keep the model's own default: the generated configuration
+#: names no reasoning effort for them, so their entries must carry no level.
+MODEL_DEFAULT_IDS = (
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+)
 
 
 def digest(path: Path) -> str:
@@ -90,6 +110,18 @@ def main() -> int:
             problems.append(
                 "%s: bad default_reasoning_level %r" % (model_id, level)
             )
+        expected_level = REASONING_DEFAULTS.get(model_id)
+        if expected_level is not None and level != expected_level:
+            problems.append(
+                "%s: default_reasoning_level is %r, the policy requires %r"
+                % (model_id, level, expected_level)
+            )
+        if model_id in MODEL_DEFAULT_IDS and level is not None:
+            problems.append(
+                "%s: GPT and Claude keep the model's own default, so the entry "
+                "must not carry default_reasoning_level %r"
+                % (model_id, level)
+            )
     for path in COPIES:
         if not path.is_file():
             problems.append("missing copy: %s" % path)
@@ -100,8 +132,16 @@ def main() -> int:
             print("FAIL %s" % problem)
         return 1
     print(
-        "OK %d models; canonical and %d submodule checkouts share sha256 %s"
-        % (len(seen), len(COPIES), expected[:16])
+        "OK %d models; default reasoning levels %s; canonical and %d submodule "
+        "checkouts share sha256 %s"
+        % (
+            len(seen),
+            ", ".join(
+                "%s=%s" % pair for pair in sorted(REASONING_DEFAULTS.items())
+            ),
+            len(COPIES),
+            expected[:16],
+        )
     )
     return 0
 

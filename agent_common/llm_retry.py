@@ -792,6 +792,23 @@ def compaction_basic_yaml(
     )
 
 
+#: The Dots API exposes a single thinking level, spelled ``max`` on the wire.
+#: Every thinking level a caller may request therefore maps onto it, while a
+#: request that turns thinking off sets ``reasoningEfforts: false`` (the
+#: absence of the parameter is the API's lower state).  ``high`` is the level
+#: the shared catalog records as this deployment's default.
+_DOTS_THINKING_EFFORTS: Tuple[str, ...] = (
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
+_DOTS_THINKING_OFF = frozenset({"", "0", "false", "no", "none", "off"})
+_DOTS_WIRE_EFFORT = "max"
+
+
 def dots_dsh_overlay(
     policy: Optional[Mapping[str, Any]] = None,
     *,
@@ -801,6 +818,7 @@ def dots_dsh_overlay(
     max_tokens: int,
     compaction_base_url: Optional[str] = None,
     stream_idle_timeout_ms: Optional[int] = None,
+    reasoning_effort: str = "high",
 ) -> str:
     """The complete DSH overlay for the Dots route.
 
@@ -810,19 +828,34 @@ def dots_dsh_overlay(
     compaction provider carries no second ``retryPolicy``; without the proxy it
     keeps the policy.  ``compaction-basic`` routes summarization to it.
 
+    The Dots API exposes a single thinking level, so the model declares every
+    thinking level against the wire's ``max`` value and ``reasoning_effort``
+    names the level the session requests (``high`` when the caller supplies
+    none, the shared catalog's default for this model).  ``none``/``off``
+    disables effort selection entirely, which is the API's lower state.
+
     Example:
         ``dots_dsh_overlay(policy, model="dots3-note-prev", base_url=..., ...)``
-        returns the complete DSH overlay text.
+        returns the complete DSH overlay text with ``reasoningEffort: "high"``.
 
     Counterexample:
         When a compaction proxy is configured, the compaction provider
         intentionally carries no second ``retryPolicy``; adding one doubles the
-        retry budget.
+        retry budget.  The compaction model also keeps
+        ``reasoningEfforts: false``: summarization spends its budget on the
+        summary, not on a reasoning trace.
     """
     document = dict(policy or load_policy())
     dots = document["dots"]
     compaction = document["compaction"]
     compaction_base = str(compaction_base_url or base_url).rstrip("/")
+    effort = str(reasoning_effort or "high").strip().lower()
+    thinking = effort not in _DOTS_THINKING_OFF
+    levels = list(_DOTS_THINKING_EFFORTS)
+    if thinking and effort not in levels:
+        # An operator spelling outside the documented vocabulary still selects
+        # the only wire level instead of failing DSH's profile validation.
+        levels.append(effort)
     idle = int(stream_idle_timeout_ms or 0)
     idle = max(
         idle,
@@ -845,7 +878,15 @@ def dots_dsh_overlay(
         "            name: %s" % json.dumps(model),
         "            contextWindow: %d" % int(context_window),
         "            maxTokens: %d" % int(max_tokens),
-        "            reasoningEfforts: false",
+    ]
+    if thinking:
+        lines.append("            reasoningEfforts:")
+        lines.extend(
+            "              %s: %s" % (level, _DOTS_WIRE_EFFORT) for level in levels
+        )
+    else:
+        lines.append("            reasoningEfforts: false")
+    lines += [
         "        compat:",
         "          maxTokensField: max_tokens",
         "          supportsStore: false",
@@ -864,6 +905,7 @@ def dots_dsh_overlay(
         "            name: %s" % json.dumps(model),
         "            contextWindow: %d" % int(context_window),
         "            maxTokens: %d" % int(max_tokens),
+        "            # Summaries spend the completion budget, not a reasoning trace.",
         "            reasoningEfforts: false",
         "        compat:",
         "          maxTokensField: max_tokens",
@@ -879,6 +921,8 @@ def dots_dsh_overlay(
         "    provider: dots",
         "    model: %s" % json.dumps(model),
     ]
+    if thinking:
+        lines.append("    reasoningEffort: %s" % json.dumps(effort))
     lines.extend(
         compaction_basic_yaml(document, "", model).rstrip("\n").splitlines()
     )

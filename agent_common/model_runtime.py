@@ -373,17 +373,25 @@ _HARNESS_ALIASES = {
 QWEN_DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
 QWEN_DEFAULT_MODEL = "qwen3.8-27b"
 QWEN_DEFAULT_API_KEY = "dummy"
-#: qwen3.8-27b's default reasoning level is a model fact stored with the
-#: shared catalog (``default_reasoning_level``), so every checkout reads the
-#: same level.  An operator override (``PAPER_QWEN_REASONING_EFFORT``) still
-#: wins, and the deployment also accepts low and xhigh.  The literal is the
-#: fallback for a catalog that predates the field.
+#: The reasoning level each provider family serves when the operator sets no
+#: override.  The shared catalog's ``default_reasoning_level`` is authoritative
+#: (the catalog overlay above copies it into ``AGENT_MODELS``); the literals are
+#: the fallbacks for a catalog that predates the field.  GPT and Claude carry no
+#: default there on purpose: their harness configuration names no reasoning
+#: effort, so the model's own default applies.  An operator override
+#: (``PAPER_DEEPSEEK_REASONING_EFFORT``, ``PAPER_DOTS_REASONING_EFFORT``,
+#: ``PAPER_QWEN_REASONING_EFFORT``) still wins.
 QWEN_DEFAULT_EFFORT = str(
     AGENT_MODELS["qwen38-27b"].get("default_reasoning_level") or "medium"
 )
+DOTS_DEFAULT_EFFORT = str(
+    AGENT_MODELS["dots3-note-preview"].get("default_reasoning_level") or "high"
+)
+DEEPSEEK_DEFAULT_EFFORT = str(
+    AGENT_MODELS["deepseek-flash"].get("default_reasoning_level") or "max"
+)
 DOTS_DEFAULT_BASE_URL = "https://note3-prev-api.askdiandian.com/v1"
 DOTS_DEFAULT_MODEL = "dots3-note-prev"
-DOTS_DEFAULT_EFFORT = "medium"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "recursive/flint-v1.0:free"
 OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
@@ -591,6 +599,33 @@ def agent_model_label(model: Optional[str]) -> str:
     if model == MODEL_DEFAULT:
         return "harness-default"
     return "custom-endpoint" if agent_model_is_endpoint(model) else str(model)
+
+
+def default_reasoning_level(model: Any) -> Optional[str]:
+    """The reasoning level a named model serves when no operator override is set.
+
+    The shared catalog's ``default_reasoning_level`` field is the one source of
+    truth, so every harness reads the same level: ``max`` for DeepSeek,
+    ``high`` for Dots and ``medium`` for Qwen.  GPT and Claude entries
+    deliberately omit the field, because their deployments keep the model's own
+    default and the generated configuration sends no reasoning-effort field.
+
+    Example:
+        ``default_reasoning_level("deepseek-flash") == "max"``,
+        ``default_reasoning_level("dots3-note-prev") == "high"`` and
+        ``default_reasoning_level("qwen3.8-27b") == "medium"``.
+
+    Counterexample:
+        ``default_reasoning_level("gpt-sol")`` and
+        ``default_reasoning_level("claude-opus")`` return ``None``; do not
+        substitute a literal for a model that keeps its own default, and do not
+        call this for a custom endpoint URL.
+    """
+    slug = normalize_agent_model(model)
+    if slug == MODEL_DEFAULT:
+        return None
+    level = (AGENT_MODELS.get(slug) or {}).get("default_reasoning_level")
+    return str(level) if level else None
 
 
 def agent_pair_supported(harness: str, model: Optional[str]) -> bool:
@@ -1640,7 +1675,11 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
             # DeepSeek family on the old window.
             "context_window": info.get("context_window", DEEPSEEK_CONTEXT_WINDOW),
             "max_tokens": info.get("max_tokens", DEEPSEEK_MAX_TOKENS),
-            "effort": _env("PAPER_DEEPSEEK_REASONING_EFFORT", "high").lower(),
+            # The shared catalog's default is max; the adapter's own fallback
+            # for an unnamed effort is high, so this value must stay explicit.
+            "effort": _env(
+                "PAPER_DEEPSEEK_REASONING_EFFORT", DEEPSEEK_DEFAULT_EFFORT
+            ).lower(),
         }
     info = selection.model_info()
     return {
@@ -1651,6 +1690,8 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
         "model": selection.effective_model_id() or (selection.model or ""),
         "context_window": info.get("context_window"),
         "max_tokens": info.get("max_tokens"),
+        # A GPT or Claude selection names no effort: the harness/model default
+        # applies, exactly as the provider documents it.
         "effort": None,
     }
 
@@ -1883,6 +1924,31 @@ def dsh_patch_text(
                 max_tokens_override or settings["max_tokens"] or DOTS_MAX_TOKENS
             ),
             compaction_base_url=compaction_base_url,
+            reasoning_effort=str(
+                effort_override or settings["effort"] or DOTS_DEFAULT_EFFORT
+            ),
+        )
+    if family == "deepseek":
+        model = raw_model or selection.effective_model_id() or settings["model"]
+        effort = str(
+            effort_override or settings["effort"] or DEEPSEEK_DEFAULT_EFFORT
+        ).lower()
+        # The native DeepSeek adapter serves ``high`` when the request names no
+        # effort, so the catalog's default has to be written into the patch.
+        return (
+            "# Generated by generic_debug_pipeline for this stage: "
+            "--agent-model deepseek-flash.\n"
+            "# A patch layer replaces the whole entry config, so the provider route is repeated.\n"
+            "- id: agent-default-model\n"
+            "  config:\n"
+            "    provider: %s\n"
+            "    model: %s\n"
+            "    reasoningEffort: %s\n"
+            % (
+                json.dumps(provider_override or "deepseek-official"),
+                json.dumps(model),
+                json.dumps(effort),
+            )
         )
     info = selection.model_info()
     model = raw_model or selection.effective_model_id() or selection.model or ""
@@ -1891,6 +1957,8 @@ def dsh_patch_text(
         or info.get("dsh_provider")
         or ("openai" if family == "gpt" else "deepseek-official")
     )
+    # GPT and Claude keep the model's own default: the patch names no
+    # reasoningEffort, so the harness never overrides the model's choice.
     return (
         "# Generated by generic_debug_pipeline for this stage: --agent-model.\n"
         "# A patch layer replaces the whole entry config, so the provider route is repeated.\n"
@@ -1947,7 +2015,8 @@ def codex_provider_args(
                 int(settings["context_window"] or DEEPSEEK_CONTEXT_WINDOW),
             ),
             _codex_config(
-                "model_reasoning_effort", settings["effort"] or "high"
+                "model_reasoning_effort",
+                settings["effort"] or DEEPSEEK_DEFAULT_EFFORT,
             ),
         ]
         return [item for pair in (["-c", value] for value in values) for item in pair]
@@ -2065,7 +2134,11 @@ def claude_environment(
             "ANTHROPIC_DEFAULT_SONNET_MODEL": primary,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": small,
             "CLAUDE_CODE_SUBAGENT_MODEL": small,
-            "CLAUDE_CODE_EFFORT_LEVEL": "max",
+            # Same catalog default as the DSH and Codex routes (max); an
+            # operator override of the DeepSeek effort applies here too.
+            "CLAUDE_CODE_EFFORT_LEVEL": str(
+                settings["effort"] or DEEPSEEK_DEFAULT_EFFORT
+            ),
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "786432",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         }

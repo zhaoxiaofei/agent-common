@@ -88,6 +88,31 @@ See [`API.md`](API.md) for the supported imports and usage recipes.  Every
 public function and method has a docstring with an `Example` and a
 `Counterexample`, enforced by `test_public_api_docs.py`.
 
+## Default reasoning levels
+
+The catalog's `default_reasoning_level` is the one policy every harness reads
+when the operator sets no override; `check_model_catalog.py` pins it.  The
+generated DSH overlay and the Codex `-c` overrides resolve the same value
+through `model_runtime`, so a level cannot drift between a checkout and an
+adapter.  The Claude Code route applies the value only where the
+Anthropic-compatible endpoint documents the effort field (DeepSeek); the qwen
+and dots routes leave Claude Code's own effort setting untouched rather than
+send a field those endpoints do not document.
+
+| Model | Default level | Where it is applied |
+| --- | --- | --- |
+| `deepseek-flash` | `max` | the DSH patch names `reasoningEffort: max` (the DeepSeek adapter would otherwise serve `high`), the Codex route passes `model_reasoning_effort=max`, and Claude Code gets `CLAUDE_CODE_EFFORT_LEVEL=max` |
+| `dots3-note-prev` | `high` | the Dots API exposes one thinking level; the DSH overlay declares every thinking level against the wire's `max` value and names `reasoningEffort: high`, and the Codex route passes `high` |
+| `qwen3.8-27b` | `medium` | the balanced level, not the wire's highest `xhigh`; the wire still accepts `low` and `xhigh` as overrides |
+| `gpt-6.1-sol` / `gpt-6.1-terra` | the model's own default | no `reasoningEffort` field is sent |
+| `claude-opus-5-5` / `claude-sonnet-5-5` | the model's own default | no `reasoningEffort` field is sent |
+
+`model_runtime.default_reasoning_level(model)` returns the catalog value and
+`None` for a model that keeps its own default.  An operator override
+(`PAPER_DEEPSEEK_REASONING_EFFORT`, `PAPER_DOTS_REASONING_EFFORT` or
+`PAPER_QWEN_REASONING_EFFORT`) still wins; `none`/`off` turns Dots thinking
+off by disabling effort selection.
+
 ## Verification
 
 ```bash
