@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
+import pkgutil
 import unittest
 
-from agent_common import agent_cli, chat, dsh_events, llm_retry, model_runtime
+import agent_common
 
-MODULES = (agent_cli, chat, dsh_events, llm_retry, model_runtime)
+# Discover every module in the package so a newly exported helper cannot evade
+# the documentation contract.
+MODULES = tuple(
+    importlib.import_module(f"agent_common.{module.name}")
+    for module in pkgutil.iter_modules(agent_common.__path__)
+    if not module.name.startswith("_")
+)
 
 
 def public_functions(module):
