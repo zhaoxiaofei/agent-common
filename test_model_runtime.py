@@ -132,6 +132,19 @@ class DefaultReasoningLevelTests(unittest.TestCase):
             model_runtime.claude_environment(self.selection("gpt-sol")), {}
         )
 
+    def test_an_unknown_dots_effort_falls_back_to_the_default_level(self):
+        overlay = llm_retry.dots_dsh_overlay(
+            model="dots3-note-prev",
+            base_url="https://note3-prev-api.askdiandian.com/v1",
+            context_window=393000,
+            max_tokens=65536,
+            reasoning_effort="turbo",
+        )
+        # The overlay must never declare a level DSH's schema rejects; the API
+        # has one thinking level, so the unknown spelling is the default.
+        self.assertIn('    reasoningEffort: "high"', overlay)
+        self.assertNotIn("turbo", overlay)
+
     def test_thinking_off_disables_dots_effort_selection(self):
         overlay = llm_retry.dots_dsh_overlay(
             model="dots3-note-prev",

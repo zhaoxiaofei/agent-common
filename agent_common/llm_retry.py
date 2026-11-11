@@ -832,7 +832,9 @@ def dots_dsh_overlay(
     thinking level against the wire's ``max`` value and ``reasoning_effort``
     names the level the session requests (``high`` when the caller supplies
     none, the shared catalog's default for this model).  ``none``/``off``
-    disables effort selection entirely, which is the API's lower state.
+    disables effort selection entirely, which is the API's lower state, and an
+    unrecognised non-``off`` spelling is treated as the default (every
+    thinking level reaches the same wire value).
 
     Example:
         ``dots_dsh_overlay(policy, model="dots3-note-prev", base_url=..., ...)``
@@ -851,11 +853,12 @@ def dots_dsh_overlay(
     compaction_base = str(compaction_base_url or base_url).rstrip("/")
     effort = str(reasoning_effort or "high").strip().lower()
     thinking = effort not in _DOTS_THINKING_OFF
+    if thinking and effort not in _DOTS_THINKING_EFFORTS:
+        # The API has one thinking level, so an unrecognised non-off spelling
+        # cannot change the request.  Use the deployment default rather than
+        # declaring a level DSH's schema would reject.
+        effort = "high"
     levels = list(_DOTS_THINKING_EFFORTS)
-    if thinking and effort not in levels:
-        # An operator spelling outside the documented vocabulary still selects
-        # the only wire level instead of failing DSH's profile validation.
-        levels.append(effort)
     idle = int(stream_idle_timeout_ms or 0)
     idle = max(
         idle,

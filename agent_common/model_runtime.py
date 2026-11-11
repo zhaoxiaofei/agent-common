@@ -662,13 +662,13 @@ def default_reasoning_level(model: Any) -> Optional[str]:
     """The reasoning level a named model serves when no operator override is set.
 
     The shared catalog's ``default_reasoning_level`` field is the one source of
-    truth, so every harness reads the same level: ``max`` for DeepSeek,
+    truth, so every harness reads the same level: ``high`` for DeepSeek,
     ``high`` for Dots and ``medium`` for Qwen.  GPT and Claude entries
     deliberately omit the field, because their deployments keep the model's own
     default and the generated configuration sends no reasoning-effort field.
 
     Example:
-        ``default_reasoning_level("deepseek-flash") == "max"``,
+        ``default_reasoning_level("deepseek-flash") == "high"``,
         ``default_reasoning_level("dots3-note-prev") == "high"`` and
         ``default_reasoning_level("qwen3.8-27b") == "medium"``.
 
@@ -1729,8 +1729,9 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
             # DeepSeek family on the old window.
             "context_window": info.get("context_window", DEEPSEEK_CONTEXT_WINDOW),
             "max_tokens": info.get("max_tokens", DEEPSEEK_MAX_TOKENS),
-            # The shared catalog's default is max; the adapter's own fallback
-            # for an unnamed effort is high, so this value must stay explicit.
+            # The catalog's default is named explicitly rather than left to
+            # the adapter's own fallback, so a catalog revision is the only
+            # place this level changes.
             "effort": _env(
                 "PAPER_DEEPSEEK_REASONING_EFFORT", DEEPSEEK_DEFAULT_EFFORT
             ).lower(),
@@ -2188,8 +2189,10 @@ def claude_environment(
             "ANTHROPIC_DEFAULT_SONNET_MODEL": primary,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": small,
             "CLAUDE_CODE_SUBAGENT_MODEL": small,
-            # Same catalog default as the DSH and Codex routes (max); an
-            # operator override of the DeepSeek effort applies here too.
+            # Same catalog default as the DSH and Codex routes; an operator
+            # override of the DeepSeek effort applies here too.  Claude Code
+            # ignores a value outside low/medium/high/max and keeps its own
+            # default, so an ``off`` override cannot break this route.
             "CLAUDE_CODE_EFFORT_LEVEL": str(
                 settings["effort"] or DEEPSEEK_DEFAULT_EFFORT
             ),
