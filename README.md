@@ -13,6 +13,10 @@ agent_common/                 the import package (underscores)
   model_catalog.json          canonical model-capacity catalog
   llm_policy.json             canonical per-LLM-call retry / dual-key policy
   llm_retry.py                retry schedule, DSH overlay and loopback proxy
+  dsh_events.py               dsh --json turn-end/error parsing (GDP + paper-refine)
+  chat.py                     chat token budgeting/response validation
+                              (paper-refine + paper-refine-eval)
+  agent_cli.py                dsh argv construction (GDP + paper-refine)
 check_*.py                    cross-repo consistency checks
 test_llm_retry.py             retry-policy tests
 ```
@@ -90,3 +94,14 @@ python3 -m unittest discover -s repos/agent-common -p 'test_*.py'
 The three checks read the `agent-common/agent_common/` package inside each
 sibling checkout's submodule, so they fail if a checkout is not initialized or
 if its submodule was modified locally.
+
+## Shared logic modules
+
+* `dsh_events.py` — one definition of the two `dsh --json` turn-end shapes,
+  the success allowlist and turn-end error extraction.  GDP's runner and the
+  paper-refine adapters both use it.
+* `chat.py` — prompt-token estimation, completion budgeting and
+  `finish_reason`/message validation.  The paper-refine adapters and
+  paper-refine-eval's `pr_eval.llm` both use it.
+* `agent_cli.py` — `build_dsh_argv` for a one-shot headless run.  GDP's runner
+  and the paper-refine adapters both use it.
