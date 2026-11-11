@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Verify the shared LLM retry/compaction policy and its generated copies.
+"""Verify the shared LLM retry/compaction policy in every checkout.
 
 Canonical files: ``repos/agent_common/llm_policy.json`` and
 ``repos/agent_common/llm_retry.py``.  Each checkout mounts this repository as
-the ``agent_common/`` submodule;
-this script also checks the derived behaviour that matters:
+the ``agent_common/`` submodule.  This script also checks the derived
+behaviour that matters:
 
 * the schedule is 10s, 20s, ... capped at 3600s (ten retries);
 * the compaction route names a second Dots key;
@@ -103,7 +103,7 @@ def main() -> int:
             print("FAIL %s" % problem)
         return 1
     print(
-        "OK schedule %r; canonical and %d copies share sha256 %s"
+        "OK schedule %r; canonical and %d submodule checkouts share sha256 %s"
         % (expected, len(COPIES), digest(CANONICAL_JSON)[:16])
     )
     return 0

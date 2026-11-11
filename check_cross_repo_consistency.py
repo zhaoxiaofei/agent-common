@@ -3,8 +3,8 @@
 
 Each checkout is imported in its own subprocess (with its own interpreter), so
 the check exercises the loader that actually ships in that repository rather
-than re-reading the JSON.  Byte-identity of the four catalog copies is checked
-first by ``check_model_catalog.py``.
+than re-reading the JSON.  Byte-identity of the catalog in all three submodule
+checkouts is checked first by ``check_model_catalog.py``.
 
     python3 repos/agent_common/check_cross_repo_consistency.py
 """

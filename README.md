@@ -49,7 +49,8 @@ git add -A && git commit -m "..."
 
 # 2. Point each checkout at the new commit.
 cd repos/generic-debug-pipeline
-git submodule update --remote agent_common   # or: git -C agent_common checkout <sha>
+git -C agent_common fetch origin             # origin is the path in .gitmodules
+git -C agent_common checkout <sha>
 git add .gitmodules agent_common             # main/release only
 git commit -m "Update agent_common"
 ```

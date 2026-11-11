@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Verify that every checkout carries an identical copy of the model catalog.
+"""Verify the model catalog in every checkout's agent_common submodule.
 
 Canonical file: ``repos/agent_common/model_catalog.json``.  Each checkout
 mounts this repository as ``agent_common/``; run this after editing the catalog
-and committing it here; it fails on a byte
-difference (the copies drifted) or an invalid capacity pair.
+and committing it here.  It fails on a byte difference (a checkout's submodule
+drifted) or an invalid capacity pair.
 
     python3 repos/agent_common/check_model_catalog.py
 """
@@ -100,7 +100,7 @@ def main() -> int:
             print("FAIL %s" % problem)
         return 1
     print(
-        "OK %d models; canonical and %d copies share sha256 %s"
+        "OK %d models; canonical and %d submodule checkouts share sha256 %s"
         % (len(seen), len(COPIES), expected[:16])
     )
     return 0
