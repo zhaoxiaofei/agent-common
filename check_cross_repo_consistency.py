@@ -6,7 +6,7 @@ the check exercises the loader that actually ships in that repository rather
 than re-reading the JSON.  Byte-identity of the catalog in all three submodule
 checkouts is checked first by ``check_model_catalog.py``.
 
-    python3 repos/agent_common/check_cross_repo_consistency.py
+    python3 repos/agent-common/check_cross_repo_consistency.py
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from pathlib import Path
 
 COMMON = Path(__file__).resolve().parent
 ROOT = COMMON.parent
-CATALOG = COMMON / "model_catalog.json"
+CATALOG = COMMON / "agent_common" / "model_catalog.json"
 CATALOGUE = {m["id"]: m for m in json.loads(CATALOG.read_text(encoding="utf-8"))["models"]}
 
 GDP = ROOT / "generic-debug-pipeline"

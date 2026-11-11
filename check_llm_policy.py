@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Verify the shared LLM retry/compaction policy in every checkout.
 
-Canonical files: ``repos/agent_common/llm_policy.json`` and
-``repos/agent_common/llm_retry.py``.  Each checkout mounts this repository as
-the ``agent_common/`` submodule.  This script also checks the derived
+Canonical files: ``repos/agent-common/agent_common/llm_policy.json`` and
+``repos/agent-common/agent_common/llm_retry.py``.  Each checkout mounts this
+repository as the ``agent-common/`` submodule and imports the inner
+``agent_common`` package.  This script also checks the derived
 behaviour that matters:
 
 * the schedule is 10s, 20s, ... capped at 3600s (ten retries);
@@ -11,7 +12,7 @@ behaviour that matters:
 * the paper-refine adapters that cannot import a sibling module carry the same
   constants.
 
-    python3 repos/agent_common/check_llm_policy.py
+    python3 repos/agent-common/check_llm_policy.py
 """
 from __future__ import annotations
 
@@ -22,12 +23,13 @@ from pathlib import Path
 
 COMMON = Path(__file__).resolve().parent
 ROOT = COMMON.parent
-CANONICAL_JSON = COMMON / "llm_policy.json"
-CANONICAL_MODULE = COMMON / "llm_retry.py"
+CANONICAL_DIR = COMMON / "agent_common"
+CANONICAL_JSON = CANONICAL_DIR / "llm_policy.json"
+CANONICAL_MODULE = CANONICAL_DIR / "llm_retry.py"
 COPIES = (
-    ROOT / "generic-debug-pipeline" / "agent_common",
-    ROOT / "paper-refine" / "agent_common",
-    ROOT / "paper-refine-eval" / "agent_common",
+    ROOT / "generic-debug-pipeline" / "agent-common" / "agent_common",
+    ROOT / "paper-refine" / "agent-common" / "agent_common",
+    ROOT / "paper-refine-eval" / "agent-common" / "agent_common",
 )
 # ``$HOME/generic_debug_pipeline_working_copy`` is a disposable checkout that the
 # next ``git pull && git checkout .`` overwrites, so it is deliberately not
@@ -79,7 +81,7 @@ def main() -> int:
             copy = directory / name
             if not copy.is_file():
                 problems.append("missing copy: %s" % copy)
-            elif digest(copy) != digest(COMMON / name):
+            elif digest(copy) != digest(CANONICAL_DIR / name):
                 problems.append("copy differs from canonical: %s" % copy)
 
     # The paper-refine adapters now consume the shared runtime rather than

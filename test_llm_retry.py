@@ -9,7 +9,7 @@ import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from llm_retry import DEFAULT_POLICY, RetryProxy, RetrySchedule, load_policy
+from agent_common.llm_retry import DEFAULT_POLICY, RetryProxy, RetrySchedule, load_policy
 
 
 class ScheduleTests(unittest.TestCase):

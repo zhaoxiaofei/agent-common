@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 #: Fallback used when ``llm_policy.json`` is absent or malformed.  Keep this in
-#: sync with the canonical JSON; ``agent_common/check_llm_policy.py`` verifies it.
+#: sync with the canonical JSON; ``agent-common/check_llm_policy.py`` verifies it.
 DEFAULT_POLICY: Dict[str, Any] = {
     "schema_version": 1,
     "retry": {

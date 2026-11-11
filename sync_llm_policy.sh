@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # The shared runtime is an independent repository (this directory) mounted as
-# the ``agent_common`` submodule of every checkout.  There are no per-checkout
+# the ``agent-common`` submodule of every checkout.  There are no per-checkout
 # copies to install: edit and commit here, then check out the pinned submodule
 # commit in each checkout.
 
@@ -19,8 +19,8 @@ for repo in generic-debug-pipeline paper-refine paper-refine-eval; do
         printf 'skip (not a git checkout): %s\n' "$checkout"
         continue
     fi
-    git -C "$checkout" submodule update --init --recursive agent_common
-    printf 'synced submodule %s/agent_common\n' "$checkout"
+    git -C "$checkout" submodule update --init --recursive agent-common
+    printf 'synced submodule %s/agent-common\n' "$checkout"
 done
 
-printf 'OK: agent_common submodule checked out; run check_llm_policy.py\n'
+printf 'OK: agent-common submodule checked out; run check_llm_policy.py\n'

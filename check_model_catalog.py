@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Verify the model catalog in every checkout's agent_common submodule.
 
-Canonical file: ``repos/agent_common/model_catalog.json``.  Each checkout
-mounts this repository as ``agent_common/``; run this after editing the catalog
+Canonical file: ``repos/agent-common/agent_common/model_catalog.json``.  Each
+checkout mounts this repository as ``agent-common/``; run this after editing the catalog
 and committing it here.  It fails on a byte difference (a checkout's submodule
 drifted) or an invalid capacity pair.
 
-    python3 repos/agent_common/check_model_catalog.py
+    python3 repos/agent-common/check_model_catalog.py
 """
 from __future__ import annotations
 
@@ -17,11 +17,11 @@ from pathlib import Path
 
 COMMON = Path(__file__).resolve().parent
 ROOT = COMMON.parent
-CANONICAL = COMMON / "model_catalog.json"
+CANONICAL = COMMON / "agent_common" / "model_catalog.json"
 COPIES = [
-    ROOT / "generic-debug-pipeline" / "agent_common" / "model_catalog.json",
-    ROOT / "paper-refine-eval" / "agent_common" / "model_catalog.json",
-    ROOT / "paper-refine" / "agent_common" / "model_catalog.json",
+    ROOT / "generic-debug-pipeline" / "agent-common" / "agent_common" / "model_catalog.json",
+    ROOT / "paper-refine-eval" / "agent-common" / "agent_common" / "model_catalog.json",
+    ROOT / "paper-refine" / "agent-common" / "agent_common" / "model_catalog.json",
 ]
 
 
