@@ -108,21 +108,19 @@ send a field those endpoints do not document.
 | `claude-opus-5-5` / `claude-sonnet-5-5` | the model's own default | no `reasoningEffort` field is sent |
 
 `model_runtime.default_reasoning_level(model)` returns the catalog value and
-`None` for a model that keeps its own default.  An operator override
-(`PAPER_DEEPSEEK_REASONING_EFFORT`, `PAPER_DOTS_REASONING_EFFORT` or
-`PAPER_QWEN_REASONING_EFFORT`) still wins; `none`/`off` turns Dots thinking
-off by disabling effort selection.
+`None` for a model that keeps its own default.  The one operator override is
+`PAPER_AGENT_REASONING_EFFORT`; `none`/`off` turns Dots thinking off by
+disabling effort selection.
 
 A consumer's `--reasoning-effort LEVEL` (gdp, paper-refine and
-paper-refine-eval all provide one) exports `PAPER_AGENT_REASONING_EFFORT`
-(`GDP_AGENT_REASONING_EFFORT` is an alias), which overrides every family —
-including GPT and Claude, whose default is otherwise the model's own.  The
+paper-refine-eval all provide one) exports the single
+`PAPER_AGENT_REASONING_EFFORT`, which overrides every family — including GPT
+and Claude, whose default is otherwise the model's own.  The
 vocabulary is `off|minimal|low|medium|high|xhigh|max` (`none` is accepted for
 `off`), and a family that does not document a level uses its nearest one:
 DeepSeek's `medium`→`high`; Qwen's `high` and `max`→`xhigh`.  The one table is
 `model_runtime.normalize_reasoning_effort(model, level)`; an unknown level is
-an error, never a silent fallback.  The per-family variables remain as
-narrower overrides for a consumer that does not expose the flag.
+an error, never a silent fallback.
 
 **Every common model setting lives here.**  Context windows, the harness
 output cap, the single-shot chat cap, the default reasoning level, the base

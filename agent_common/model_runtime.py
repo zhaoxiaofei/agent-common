@@ -412,8 +412,7 @@ QWEN_DEFAULT_API_KEY = "dummy"
 #: the fallbacks for a catalog that predates the field.  GPT and Claude carry no
 #: default there on purpose: their harness configuration names no reasoning
 #: effort, so the model's own default applies.  An operator override
-#: (``PAPER_DEEPSEEK_REASONING_EFFORT``, ``PAPER_DOTS_REASONING_EFFORT``,
-#: ``PAPER_QWEN_REASONING_EFFORT``) still wins.
+#: (``PAPER_AGENT_REASONING_EFFORT``) still wins.
 QWEN_DEFAULT_EFFORT = str(
     AGENT_MODELS["qwen38-27b"].get("default_reasoning_level") or "medium"
 )
@@ -468,48 +467,26 @@ API_PROVIDER_DEFAULTS: Dict[str, Dict[str, Optional[str]]] = {
     },
 }
 
-#: Environment variable the generated provider config names for a custom
-#: endpoint's key.  The reference implementation uses the PAPER_ spelling; the
-#: GDP_ spelling is accepted as an alias so the pipeline's own variables work
-#: too.  The key itself is only ever exported to the child, never written into
-#: the provider patch, the run record or the log.
+#: One name per shared agent knob: the key the generated provider config names
+#: for a custom endpoint, the model/name/prep request options, and the harness
+#: selection.  The historical PAPER_/GDP_ aliases are gone: a consumer's CLI
+#: flag exports the single name below, and the runtime reads only that name.
+#: The key itself is only ever exported to the child, never written into the
+#: provider patch, the run record or the log.
 AGENT_MODEL_API_KEY_ENV = "PAPER_AGENT_MODEL_API_KEY"
-AGENT_MODEL_API_KEY_ENV_ALIASES: Tuple[str, ...] = (
-    "PAPER_AGENT_MODEL_API_KEY",
-    "GDP_AGENT_MODEL_API_KEY",
-)
 AGENT_MODEL_NAME_ENV = "PAPER_AGENT_MODEL_NAME"
-AGENT_MODEL_NAME_ENV_ALIASES: Tuple[str, ...] = (
-    "PAPER_AGENT_MODEL_NAME",
-    "GDP_AGENT_MODEL_NAME",
-)
 AGENT_MODEL_PREP_JSON_ENV = "PAPER_AGENT_MODEL_PREP_JSON"
-AGENT_MODEL_PREP_JSON_ENV_ALIASES: Tuple[str, ...] = (
-    "PAPER_AGENT_MODEL_PREP_JSON",
-    "GDP_AGENT_MODEL_PREP_JSON",
-)
-AGENT_HARNESS_ENV_ALIASES: Tuple[str, ...] = (
-    "PAPER_AGENT_HARNESS",
-    "GDP_AGENT_HARNESS",
-)
-AGENT_MODEL_ENV_ALIASES: Tuple[str, ...] = (
-    "PAPER_AGENT_MODEL",
-    "GDP_AGENT_MODEL",
-)
+AGENT_HARNESS_ENV = "PAPER_AGENT_HARNESS"
+AGENT_MODEL_ENV = "PAPER_AGENT_MODEL"
 
 #: Operator override for the reasoning level of whichever model a selection
-#: names.  It wins over the per-family variables (``PAPER_QWEN_...`` etc.) and
-#: the catalog default, and it is the only override that also reaches GPT and
-#: Claude, whose default is the model's own.  A consumer's
+#: names.  It wins over the catalog default, and it is the only override that
+#: also reaches GPT and Claude, whose default is the model's own.  A consumer's
 #: ``--reasoning-effort`` flag exports this; ``none`` is accepted as a spelling
 #: of ``off``.  The vocabulary is the union the harnesses understand; a family
 #: that lacks a level uses its nearest documented one (see
 #: :func:`normalize_reasoning_effort`).
 AGENT_REASONING_EFFORT_ENV = "PAPER_AGENT_REASONING_EFFORT"
-AGENT_REASONING_EFFORT_ENV_ALIASES: Tuple[str, ...] = (
-    "PAPER_AGENT_REASONING_EFFORT",
-    "GDP_AGENT_REASONING_EFFORT",
-)
 REASONING_EFFORT_LEVELS: Tuple[str, ...] = (
     "off",
     "minimal",
@@ -524,22 +501,13 @@ DEFAULT_ENDPOINT_CONTEXT = 32768
 DEFAULT_ENDPOINT_MAX_TOKENS = 8192
 
 
-def _first_env(names: Iterable[str], default: str = "") -> str:
-    for name in names:
-        value = os.environ.get(name)
-        if value not in (None, ""):
-            return value
-    return default
-
-
 def reasoning_effort_override() -> Optional[str]:
     """The operator's explicit reasoning level for the selected model, or None.
 
     A consumer's ``--reasoning-effort`` flag exports
-    ``PAPER_AGENT_REASONING_EFFORT`` (``GDP_AGENT_REASONING_EFFORT`` is an
-    alias).  The value wins over the per-family variables and the catalog
-    default, for every family, including GPT and Claude (whose default is the
-    model's own).  ``none`` is accepted as a spelling of ``off``.
+    ``PAPER_AGENT_REASONING_EFFORT``.  The value wins over the catalog default,
+    for every family, including GPT and Claude (whose default is the model's
+    own).  ``none`` is accepted as a spelling of ``off``.
 
     Example:
         With ``PAPER_AGENT_REASONING_EFFORT=high`` it returns ``"high"``; with
@@ -550,7 +518,7 @@ def reasoning_effort_override() -> Optional[str]:
         harnesses accept different vocabularies, so a misspelling must fail
         before a run rather than produce an invalid provider config.
     """
-    value = _first_env(AGENT_REASONING_EFFORT_ENV_ALIASES).strip().lower()
+    value = _env(AGENT_REASONING_EFFORT_ENV).strip().lower()
     if not value:
         return None
     if value == "none":
@@ -1018,7 +986,7 @@ class AgentSelection:
                 self.api_key
                 or (
                     self.is_endpoint
-                    and _first_env(AGENT_MODEL_API_KEY_ENV_ALIASES)
+                    and _env(AGENT_MODEL_API_KEY_ENV)
                 )
             ),
             "prep_keys": sorted(str(key) for key in self.prep_json),
@@ -1428,7 +1396,7 @@ def resolve_endpoint_model(
     if selection.model_name:
         if not probe:
             return selection.model_name, None, ""
-        key = api_key or selection.api_key or _first_env(AGENT_MODEL_API_KEY_ENV_ALIASES)
+        key = api_key or selection.api_key or _env(AGENT_MODEL_API_KEY_ENV)
         entries = _endpoint_catalog(endpoint_base(str(selection.model or "")), key)
         return selection.model_name, _endpoint_context(entries, selection.model_name), ""
     query_model = endpoint_query_model(str(selection.model or ""))
@@ -1436,7 +1404,7 @@ def resolve_endpoint_model(
         return query_model, None, ""
     if not probe:
         return "default", None, ""
-    key = api_key or selection.api_key or _first_env(AGENT_MODEL_API_KEY_ENV_ALIASES)
+    key = api_key or selection.api_key or _env(AGENT_MODEL_API_KEY_ENV)
     entries = _endpoint_catalog(endpoint_base(str(selection.model or "")), key)
     models = [str(entry.get("id")) for entry in entries]
     if len(models) == 1:
@@ -1784,7 +1752,7 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
         return {
             "family": family,
             "base_url": base,
-            "api_key": selection.api_key or _first_env(AGENT_MODEL_API_KEY_ENV_ALIASES),
+            "api_key": selection.api_key or _env(AGENT_MODEL_API_KEY_ENV),
             "api_key_env": AGENT_MODEL_API_KEY_ENV,
             "model": selection.effective_model_id() or "default",
             "context_window": _int_env(
@@ -1807,8 +1775,7 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
             ),
             "max_tokens": _int_env("PAPER_QWEN_MAX_TOKENS", QWEN_MAX_TOKENS),
             "effort": normalize_reasoning_effort(
-                "qwen38-27b",
-                override or _env("PAPER_QWEN_REASONING_EFFORT", QWEN_DEFAULT_EFFORT),
+                "qwen38-27b", override or QWEN_DEFAULT_EFFORT
             ),
         }
     if family == "dots":
@@ -1831,9 +1798,7 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
             ),
             "max_tokens": _int_env("PAPER_DOTS_MAX_TOKENS", DOTS_MAX_TOKENS),
             "effort": normalize_reasoning_effort(
-                "dots3-note-preview",
-                override
-                or _env("PAPER_DOTS_REASONING_EFFORT", DOTS_DEFAULT_EFFORT),
+                "dots3-note-preview", override or DOTS_DEFAULT_EFFORT
             ),
         }
     if family == "deepseek":
@@ -1853,11 +1818,7 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
             # the adapter's own fallback, so a catalog revision is the only
             # place this level changes.
             "effort": normalize_reasoning_effort(
-                "deepseek-flash",
-                override
-                or _env(
-                    "PAPER_DEEPSEEK_REASONING_EFFORT", DEEPSEEK_DEFAULT_EFFORT
-                ),
+                "deepseek-flash", override or DEEPSEEK_DEFAULT_EFFORT
             ),
         }
     info = selection.model_info()
@@ -1906,7 +1867,6 @@ def selection_env(selection: Optional[AgentSelection]) -> Dict[str, str]:
     if family == "endpoint":
         key = settings["api_key"] or "dummy"
         env[AGENT_MODEL_API_KEY_ENV] = key
-        env["GDP_AGENT_MODEL_API_KEY"] = key
     elif family == "deepseek":
         if settings["api_key"]:
             env.setdefault("DEEPSEEK_API_KEY", str(settings["api_key"]))

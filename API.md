@@ -68,12 +68,12 @@ same way — `context_window`, `max_tokens`, `chat_max_tokens` — and
 `dsh_patch_text` and `codex_provider_args` already apply the effort, so a
 consumer that only needs the number (for an adapter default, a log line or a
 documented table) should call these helpers instead of hard-coding a literal.
-`PAPER_DEEPSEEK_REASONING_EFFORT`, `PAPER_DOTS_REASONING_EFFORT` and
-`PAPER_QWEN_REASONING_EFFORT` remain operator overrides.
+The one operator override is `PAPER_AGENT_REASONING_EFFORT`; there are no
+per-family reasoning variables.
 
 `reasoning_effort_override()` returns the shared
 `PAPER_AGENT_REASONING_EFFORT` value (the channel a consumer's
-`--reasoning-effort` flag exports; `GDP_AGENT_REASONING_EFFORT` is an alias),
+`--reasoning-effort` flag exports),
 and `normalize_reasoning_effort(model, level)` translates the generic
 `off|minimal|low|medium|high|xhigh|max` vocabulary to the level the model's
 wire accepts.  A consumer should set the environment variable (or pass the
