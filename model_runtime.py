@@ -1,8 +1,8 @@
 """Shared model, harness and provider runtime for all three repositories.
 
-The canonical copy lives in ``repos/common``; ``update_model_catalog.sh``
-installs byte-identical copies into ``gdp``, ``paper-refine`` and
-``paper-refine-eval``.  A checkout must not edit its copy.
+The canonical copy lives in ``repos/agent_common``; each checkout mounts it
+as the ``agent_common/`` git submodule (``update_model_catalog.sh`` checks the
+pinned submodule out).  A checkout must not edit the submodule's files.
 
 The two axes are:
 
@@ -125,7 +125,7 @@ LEGACY_AGENT_PAIRS: Dict[str, Tuple[Optional[str], Optional[str]]] = {
 #: 400.  Declaring the advertised window disables DSH's compaction until ~419K,
 #: past the provider's real limit.  Every capacity below is a placeholder: the
 #: authoritative numbers live in ``model_catalog.json`` beside this module (the
-#: canonical copy is ``repos/common/model_catalog.json``).
+#: canonical copy is ``repos/agent_common/model_catalog.json``).
 
 # "latest" model ids were read from the installed harness/catalog on 2026-11-10
 # (the same ids the paper-refine reference implementation records):
@@ -294,8 +294,9 @@ DEEPSEEK_CONTEXT_WINDOW = int(AGENT_MODELS["deepseek-flash"]["context_window"])
 DEEPSEEK_MAX_TOKENS = int(AGENT_MODELS["deepseek-flash"]["max_tokens"])
 
 #: Per-request retry and compaction-key policy.  The canonical file lives in
-#: ``repos/common/llm_policy.json``; the copy beside this module is installed by
-#: ``repos/common/sync_llm_policy.sh``.  A malformed copy falls back to the
+#: ``repos/agent_common/llm_policy.json``; the submodule copy beside this module
+#: is checked out by ``repos/agent_common/sync_llm_policy.sh``.  A malformed copy
+#: falls back to the
 #: documented defaults, so a run never fails over a tuning file.
 _LLM_POLICY_PATH = Path(__file__).with_name("llm_policy.json")
 LLM_POLICY = _load_llm_policy(_LLM_POLICY_PATH)
