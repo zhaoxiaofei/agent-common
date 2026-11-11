@@ -24,7 +24,16 @@ def build_dsh_argv(
     extra_args: Sequence[str] = (),
     json_stream: bool = True,
 ) -> List[str]:
-    """argv for one non-interactive ``dsh`` run (one task, final answer, exit)."""
+    """argv for one non-interactive ``dsh`` run (one task, final answer, exit).
+
+    Example:
+        ``build_dsh_argv(patch_path="/tmp/model.yml")`` returns
+        ``["dsh", "--profile", "headless", "--patch", "/tmp/model.yml", "--json"]``.
+
+    Counterexample:
+        Do not put application flags in ``patch_path``; the launcher would treat
+        them as a file name.  Put application flags in ``extra_args``.
+    """
     argv: List[str] = [dsh_bin]
     if profile:
         argv += ["--profile", str(profile)]

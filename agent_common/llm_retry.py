@@ -155,6 +155,14 @@ def load_policy(path: Optional[Any] = None) -> Dict[str, Any]:
     A missing or malformed file is not fatal: an adapter copied into a frozen
     root may not carry the JSON beside it, and refusing to start a run over a
     tuning file would be worse than using the documented defaults.
+
+    Example:
+        ``load_policy("/nonexistent/llm_policy.json")`` returns the documented
+        defaults (10 retries, 3600-second cap).
+
+    Counterexample:
+        A malformed file is not fatal either; both fall back to the defaults.  Do
+        not use this function when the caller must reject a bad policy.
     """
     candidate = Path(path) if path is not None else Path(__file__).with_name(
         "llm_policy.json"
@@ -174,7 +182,16 @@ def load_policy(path: Optional[Any] = None) -> Dict[str, Any]:
 
 
 def policy_paths(*candidates: Optional[Any]) -> Optional[Path]:
-    """First existing policy path among ``candidates``, else the module copy."""
+    """First existing policy path among ``candidates``, else the module copy.
+
+    Example:
+        ``policy_paths("/missing", "/etc/llm_policy.json")`` returns the first
+        existing path.
+
+    Counterexample:
+        When no candidate exists it returns the module's own ``llm_policy.json``
+        path, which may not exist; callers still need ``load_policy``'s fallback.
+    """
     for candidate in candidates:
         if not candidate:
             continue
@@ -216,6 +233,14 @@ class RetrySchedule:
 
         ``retry_after`` is the provider's own hint (for example from a 429
         ``Retry-After`` header); it wins up to the same 3600-second cap.
+
+        Example:
+            With the default policy, ``delay(1) == 10`` and ``delay(3) == 40``.
+
+        Counterexample:
+            ``delay(0)`` and ``delay(-1)`` both behave like the first retry; retry
+            numbers are clamped at 1, not rejected.  A positive ``retry_after`` wins
+            over exponential backoff up to the cap.
         """
         if retry_after is not None:
             try:
@@ -236,21 +261,56 @@ class RetrySchedule:
         return max(0.0, delay)
 
     def delays(self, jitter: bool = False) -> List[float]:
-        """The full configured schedule, useful for records and tests."""
+        """The full configured schedule, useful for records and tests.
+
+        Example:
+            ``RetrySchedule(load_policy()).delays()`` returns
+            ``[10, 20, 40, 80, 160, 320, 640, 1280, 2560, 3600]``.
+
+        Counterexample:
+            ``delays(jitter=True)`` adds jitter and is not the documented schedule; use
+            the default for records and tests.
+        """
         return [
             self.delay(index + 1, jitter=jitter)
             for index in range(self.max_retries)
         ]
 
     def status_is_retryable(self, status: int) -> bool:
+        """Whether an HTTP status is in the policy's retryable set.
+
+        Example:
+            The default policy returns ``True`` for 429 and 503.
+
+        Counterexample:
+            A client error such as 400 returns ``False``; not every failure is
+            transient.
+        """
         return int(status) in self.retryable_statuses
 
     def code_is_retryable(self, code: Optional[str]) -> bool:
+        """Whether a provider error code is in the policy's retryable set.
+
+        Example:
+            ``code_is_retryable("RATE_LIMIT")`` is ``True`` by default.
+
+        Counterexample:
+            ``code_is_retryable(None)`` is ``False``; a missing code is not a
+            retryable provider error.
+        """
         return bool(code) and str(code) in self.retryable_codes
 
 
 def retry_after_seconds(headers: Optional[Mapping[str, str]]) -> Optional[float]:
-    """Parse a ``Retry-After`` header as seconds from now."""
+    """Parse a ``Retry-After`` header as seconds from now.
+
+    Example:
+        ``retry_after_seconds({"Retry-After": "7"}) == 7.0``.
+
+    Counterexample:
+        An invalid or absent header returns ``None``; that means "no provider
+        hint", not zero delay.
+    """
     if not headers:
         return None
     raw = None
@@ -481,11 +541,29 @@ class RetryProxy:
         self.base_url = ""
 
     def log(self, message: str) -> None:
+        """Send one retry line to the optional callback.
+
+        Example:
+            With ``RetryProxy(..., log=print)`` retry messages are printed.
+
+        Counterexample:
+            With no callback this is a silent no-op; it never raises because
+            logging failed.
+        """
         if self._log is not None:
             self._log(message)
 
     def target_path(self, path: str) -> str:
-        """Forward ``path`` under the upstream's own base path."""
+        """Forward ``path`` under the upstream's own base path.
+
+        Example:
+            A proxy for ``https://host/v1`` forwards ``/chat/completions`` to
+            ``/v1/chat/completions``.
+
+        Counterexample:
+            A path already under the prefix is not prefixed twice; ``/v1/chat`` stays
+            ``/v1/chat``.
+        """
         requested = path or "/"
         if self._prefix and (
             requested == self._prefix or requested.startswith(self._prefix + "/")
@@ -500,7 +578,16 @@ class RetryProxy:
         headers: Mapping[str, str],
         body: Optional[bytes],
     ) -> Tuple[int, List[Tuple[str, str]], http.client.HTTPResponse, http.client.HTTPConnection]:
-        """Open one upstream request and return its unread response."""
+        """Open one upstream request and return its unread response.
+
+        Example:
+            ``open("POST", "/chat/completions", headers, body)`` returns the status,
+            headers, unread response and connection.
+
+        Counterexample:
+            The caller must read and close the response/connection (normally in a
+            ``finally``); abandoning them leaks sockets.
+        """
         target = self.target_path(path)
         forward: Dict[str, str] = {}
         for name, value in headers.items():
@@ -528,7 +615,16 @@ class RetryProxy:
         return response.status, response.getheaders(), response, connection
 
     def start(self) -> str:
-        """Start the proxy and return the base URL to put in a provider patch."""
+        """Start the proxy and return the base URL to put in a provider patch.
+
+        Example:
+            ``base = proxy.start()`` returns a loopback URL such as
+            ``http://127.0.0.1:41234/v1``.
+
+        Counterexample:
+            Starting the same proxy twice without ``stop()`` leaves two servers; create
+            one proxy per route.
+        """
         server = _RetryProxyServer(("127.0.0.1", 0), _RetryProxyHandler)
         server.proxy = self  # type: ignore[attr-defined]
         thread = threading.Thread(
@@ -544,6 +640,15 @@ class RetryProxy:
         return self.base_url
 
     def stop(self) -> None:
+        """Stop the loopback server and clear ``base_url``.
+
+        Example:
+            ``proxy.stop()`` releases the server thread after the last request.
+
+        Counterexample:
+            Calling it twice is safe, but requests made after it fail; stop only
+            after the final upstream call.
+        """
         server, thread = self._server, self._thread
         self._server = None
         self._thread = None
@@ -562,7 +667,15 @@ class RetryProxy:
 
 
 def default_log(message: str) -> None:
-    """Write one proxy retry line to stderr without failing the request."""
+    """Write one proxy retry line to stderr without failing the request.
+
+    Example:
+        ``default_log("retry 1/10 in 10s")`` writes one line to stderr.
+
+    Counterexample:
+        A broken stderr does not propagate ``OSError``; logging must never fail the
+        request.
+    """
     try:
         sys.stderr.write(message + "\n")
         sys.stderr.flush()
@@ -575,6 +688,14 @@ def retry_policy_yaml(policy: Optional[Mapping[str, Any]] = None, indent: str = 
 
     The block implements per-LLM-call retries on the agent loop's
     ``agent/request-error`` hook; it does not restart the harness or the stage.
+
+    Example:
+        ``retry_policy_yaml(policy, "  ")`` emits a ``retryPolicy:`` block with
+        attempts and delays for a DSH provider.
+
+    Counterexample:
+        It returns YAML text, not a dict; do not pass it to a YAML merge function
+        as structured data.
     """
     document = dict(policy or load_policy())
     retry = document["retry"]
@@ -598,7 +719,16 @@ def retry_policy_yaml(policy: Optional[Mapping[str, Any]] = None, indent: str = 
 
 
 def dots_compaction(policy: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    """The second Dots route (dedicated compaction key) from the policy."""
+    """The second Dots route (dedicated compaction key) from the policy.
+
+    Example:
+        ``dots_compaction()["compaction_api_key_env"]`` is
+        ``"DOTS_API_KEY_1474"`` in the default policy.
+
+    Counterexample:
+        It returns a shallow copy of the ``dots`` section; mutating nested values
+        can still affect the cached policy.
+    """
     return dict((policy or load_policy())["dots"])
 
 
@@ -607,7 +737,16 @@ def compaction_basic_yaml(
     indent: str = "",
     model: str = "",
 ) -> str:
-    """The DSH ``compaction-basic`` entry that routes summarization."""
+    """The DSH ``compaction-basic`` entry that routes summarization.
+
+    Example:
+        ``compaction_basic_yaml(policy, "", "dots3-note-prev")`` emits the
+        ``compaction-basic`` DSH entry.
+
+    Counterexample:
+        An empty ``model`` emits an empty ``summarizationModel``; pass the real
+        provider model id.
+    """
     document = dict(policy or load_policy())
     dots = document["dots"]
     compaction = document["compaction"]
@@ -653,6 +792,15 @@ def dots_dsh_overlay(
     retrying proxy.  When the proxy is in the path it owns the retries, so the
     compaction provider carries no second ``retryPolicy``; without the proxy it
     keeps the policy.  ``compaction-basic`` routes summarization to it.
+
+    Example:
+        ``dots_dsh_overlay(policy, model="dots3-note-prev", base_url=..., ...)``
+        returns the complete DSH overlay text.
+
+    Counterexample:
+        When a compaction proxy is configured, the compaction provider
+        intentionally carries no second ``retryPolicy``; adding one doubles the
+        retry budget.
     """
     document = dict(policy or load_policy())
     dots = document["dots"]
@@ -731,7 +879,16 @@ def start_retry_proxy(
     name: str = "llm-retry-proxy",
     log: Optional[Callable[[str], None]] = None,
 ) -> Tuple[Optional[RetryProxy], str]:
-    """Start one proxy and return ``(proxy, base_url)``; ``(None, "")`` on failure."""
+    """Start one proxy and return ``(proxy, base_url)``; ``(None, "")`` on failure.
+
+    Example:
+        ``proxy, base = start_retry_proxy("https://api.example/v1")`` returns a
+        loopback base URL and registers the proxy for cleanup.
+
+    Counterexample:
+        A bad or empty target returns ``(None, "")`` instead of raising; callers
+        must check the pair.
+    """
     if not target_base:
         return None, ""
     try:
@@ -745,7 +902,15 @@ def start_retry_proxy(
 
 
 def stop_retry_proxy(proxy: Optional[RetryProxy] = None) -> None:
-    """Stop one proxy, or every proxy this process started."""
+    """Stop one proxy, or every proxy this process started.
+
+    Example:
+        ``stop_retry_proxy(proxy)`` stops one proxy; ``stop_retry_proxy()`` stops
+        every proxy this process started.
+
+    Counterexample:
+        Passing an already-stopped proxy is tolerated and does nothing.
+    """
     with _PROXY_LOCK:
         targets = [proxy] if proxy is not None else list(_PROXY_REGISTRY)
         for item in targets:

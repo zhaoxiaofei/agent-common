@@ -290,6 +290,14 @@ def reload_model_catalog() -> None:
     Import-time validation uses the shared defaults.  A checkout whose policy
     differs (GDP and paper-refine-eval fail closed on a missing catalog) sets
     the flag and calls this immediately, so the policy is not silently lost.
+
+    Example:
+        ``reload_model_catalog()`` re-reads the catalog after a consumer changes
+        ``MISSING_CATALOG_IS_FATAL``.
+
+    Counterexample:
+        It does not reset ``AGENT_MODELS`` to factory defaults; it overlays the
+        current catalog, so deliberate table edits survive.
     """
     _apply_model_catalog(AGENT_MODELS)
 
@@ -456,18 +464,41 @@ def agent_choice(value: Any) -> str:
     """Normalize an operator spelling for a harness or model name.
 
     ``gpt codex``, ``gpt-codex`` and ``GPT_CODEX`` all become ``gpt-codex``.
+
+    Example:
+        ``agent_choice("GPT Codex") == "gpt-codex"``.
+
+    Counterexample:
+        It does not validate the name; an unknown value is returned normalized.
+        Use ``agent_harness_choice``/``agent_model_choice`` to reject it.
     """
     return str(value).strip().lower().replace("_", "-").replace(" ", "-")
 
 
 def agent_model_is_endpoint(value: Any) -> bool:
-    """True when ``--agent-model`` is an arbitrary chat-completions endpoint URL."""
+    """True when ``--agent-model`` is an arbitrary chat-completions endpoint URL.
+
+    Example:
+        ``agent_model_is_endpoint("https://host/v1")`` is ``True``.
+
+    Counterexample:
+        The named model ``"http-server"`` is not an endpoint; only the http(s)
+        prefix counts.
+    """
     text = str(value or "").strip().lower()
     return text.startswith("http://") or text.startswith("https://")
 
 
 def normalize_agent_model(value: Any) -> str:
-    """Canonical model name, or the URL unchanged when it is a custom endpoint."""
+    """Canonical model name, or the URL unchanged when it is a custom endpoint.
+
+    Example:
+        ``normalize_agent_model("GPT SOL") == "gpt-sol"``.
+
+    Counterexample:
+        A custom URL is returned unchanged, including its query string; use
+        ``endpoint_base`` to build a provider base URL.
+    """
     raw = str(value).strip()
     if agent_model_is_endpoint(raw):
         return raw
@@ -478,7 +509,15 @@ def normalize_agent_model(value: Any) -> str:
 
 
 def agent_model_choice(value: Any) -> str:
-    """``--agent-model`` accepts a known model name or an http(s) endpoint URL."""
+    """``--agent-model`` accepts a known model name or an http(s) endpoint URL.
+
+    Example:
+        ``agent_model_choice("GPT-6.1-SOL") == "gpt-sol"``.
+
+    Counterexample:
+        An unknown name raises ``ValueError``; a URL with a credential raises unless
+        ``REJECT_ENDPOINT_CREDENTIALS`` is disabled.
+    """
     raw = str(value).strip()
     if agent_model_is_endpoint(raw):
         try:
@@ -506,6 +545,18 @@ def agent_model_choice(value: Any) -> str:
 
 
 def agent_harness_choice(value: Any) -> str:
+    """Normalize and validate a harness choice.
+
+    Accepts the canonical names plus the operator aliases ``deepseek``,
+    ``deepseek-harness``, ``codex`` and ``claude``.
+
+    Example:
+        ``agent_harness_choice("codex") == "gpt-codex"``.
+
+    Counterexample:
+        ``"openai"`` is not an alias and raises ``ValueError``; a provider name
+        is not automatically a harness name.
+    """
     name = agent_choice(value)
     name = _HARNESS_ALIASES.get(name, name)
     if name not in AGENT_HARNESSES:
@@ -517,7 +568,16 @@ def agent_harness_choice(value: Any) -> str:
 
 
 def agent_model_label(model: Optional[str]) -> str:
-    """A short label for a model choice (an endpoint URL is not repeated)."""
+    """A short label for a model choice (an endpoint URL is not repeated).
+
+    Example:
+        ``agent_model_label("gpt-sol") == "gpt-sol"`` and
+        ``agent_model_label("https://host/v1") == "custom-endpoint"``.
+
+    Counterexample:
+        It is a display label, not a model id; ``"default"`` becomes
+        ``"harness-default"`` and cannot be passed back to the provider.
+    """
     if not model:
         return "config-owned"
     if model == MODEL_DEFAULT:
@@ -526,7 +586,15 @@ def agent_model_label(model: Optional[str]) -> str:
 
 
 def agent_pair_supported(harness: str, model: Optional[str]) -> bool:
-    """Can ``harness`` reach ``model`` over a protocol it speaks?"""
+    """Can ``harness`` reach ``model`` over a protocol it speaks?
+
+    Example:
+        ``agent_pair_supported("gpt-codex", "gpt-sol")`` is ``True``.
+
+    Counterexample:
+        ``agent_pair_supported("claude-code", "gpt-sol")`` is ``False``; the two
+        axes are not freely interchangeable.
+    """
     if model == MODEL_DEFAULT:
         return True
     if model is None:
@@ -544,14 +612,30 @@ def agent_pair_supported(harness: str, model: Optional[str]) -> bool:
 
 
 def agent_model_for_harness(harness: str) -> str:
-    """The model a harness uses when only the harness was chosen."""
+    """The model a harness uses when only the harness was chosen.
+
+    Example:
+        ``agent_model_for_harness("claude-code") == "claude-sonnet"``.
+
+    Counterexample:
+        An unknown harness falls back to the global default model rather than
+        raising; validate the harness first if that matters.
+    """
     return (AGENT_HARNESSES.get(harness) or {}).get(
         "default_model", DEFAULT_AGENT_MODEL
     )
 
 
 def agent_harness_for_model(model: str) -> str:
-    """The harness a model uses when only the model was chosen."""
+    """The harness a model uses when only the model was chosen.
+
+    Example:
+        ``agent_harness_for_model("gpt-sol") == "gpt-codex"``.
+
+    Counterexample:
+        A custom endpoint always maps to ``dsh``; do not infer ``codex`` from the
+        URL's model name.
+    """
     if model == MODEL_DEFAULT:
         return DEFAULT_AGENT_HARNESS
     if agent_model_is_endpoint(model):
@@ -562,6 +646,19 @@ def agent_harness_for_model(model: str) -> str:
 
 
 def agent_selection_label(harness: Optional[str], model: Optional[str]) -> str:
+    """A compact ``harness/model`` label for logs and run records.
+
+    The model side is passed through :func:`agent_model_label`, so an endpoint
+    is shown as ``custom-endpoint`` rather than its credential-bearing URL.
+
+    Example:
+        ``agent_selection_label("dsh", "dots3-note-preview")`` returns
+        ``"dsh/dots3-note-preview"``.
+
+    Counterexample:
+        ``agent_selection_label(None, None)`` returns ``"config-owned"``; it is
+        a display label, not a parseable model id.
+    """
     if harness and model:
         return "%s/%s" % (harness, agent_model_label(model))
     return harness or (agent_model_label(model) if model else "config-owned")
@@ -579,6 +676,14 @@ def pair_from_options(
     model's default harness (GPT -> gpt-codex, Claude -> claude-code,
     DeepSeek/Qwen/Dots/URL -> dsh) or the harness's default model (dsh ->
     deepseek-flash, gpt-codex -> gpt-sol, claude-code -> claude-sonnet) wins.
+
+    Example:
+        ``pair_from_options(None, "gpt-sol")`` returns
+        ``("gpt-codex", "gpt-sol")``.
+
+    Counterexample:
+        Empty inputs use the fallback/default pair; the function does not return
+        ``(None, None)``.
     """
     if not harness and not model:
         resolved_harness = fallback_harness or DEFAULT_AGENT_HARNESS
@@ -622,6 +727,16 @@ class AgentSelection:
         return agent_selection_label(self.harness, self.model)
 
     def model_info(self) -> Dict[str, Any]:
+        """The catalog entry for this named model, or an empty dict.
+
+        Example:
+            A ``qwen38-27b`` selection returns the catalog entry with its
+            context window and default reasoning level.
+
+        Counterexample:
+            A custom endpoint or the ``default`` sentinel returns ``{}``; the
+            caller must not read capacities from it.
+        """
         if self.model is None or self.is_endpoint or self.is_default:
             return {}
         return dict(AGENT_MODELS.get(self.model) or {})
@@ -632,6 +747,14 @@ class AgentSelection:
         ``--model`` remains the low-level override it always was.  For a custom
         endpoint it names the provider model when ``--agent-model-name`` did
         not; for a native model it replaces the catalog id.
+
+        Example:
+            A named ``qwen38-27b`` selection returns the catalog id
+            ``qwen3.8-27b``.
+
+        Counterexample:
+            A raw ``--model`` override always wins, even over an endpoint's
+            ``--agent-model-name``; do not expect the catalog id in that case.
         """
         if raw_model:
             return str(raw_model)
@@ -642,7 +765,16 @@ class AgentSelection:
         return str((AGENT_MODELS.get(self.model) or {}).get("id") or self.model)
 
     def to_record(self, raw_model: Optional[str] = None) -> Dict[str, Any]:
-        """Secret-free shape for ``command.json`` / ``status.json``."""
+        """Secret-free shape for ``command.json`` / ``status.json``.
+
+        Example:
+            The record contains ``harness``, ``model``, ``id`` and ``api_key_set`` and
+            never the key itself.
+
+        Counterexample:
+            An endpoint's query string is stripped from the recorded model; the record
+            is not a way to recover the live URL.
+        """
         record_model = (
             redact_endpoint_url(str(self.model))
             if self.is_endpoint and self.model is not None
@@ -686,6 +818,15 @@ def resolve_agent_selection(
     Raises :class:`gdp.errors.ConfigError` for a missing endpoint, an unknown
     choice, an unsupported wire-protocol pair or request options that do not
     belong to a named model.
+
+    Example:
+        ``resolve_agent_selection(harness="dsh", model="dots3-note-preview")``
+        returns an ``AgentSelection`` with credentials resolved from the
+        environment.
+
+    Counterexample:
+        A named model combined with ``api_key``/``model_name``/``prep_json`` raises
+        ``ConfigError``; those options belong to a custom endpoint only.
     """
     try:
         prep = dict(prep_json or {})
@@ -779,6 +920,14 @@ def redact_endpoint_url(url: str) -> str:
     "secret-free shape" contract and the CLI's promise that endpoint credentials are not
     written into the run record. The live selection keeps the raw URL; only the recorded copy
     is stripped.
+
+    Example:
+        ``redact_endpoint_url("https://user:secret@host/v1?api_key=x")`` returns
+        ``"https://host/v1"``.
+
+    Counterexample:
+        It is for records, not live requests; using the redacted URL would drop the
+        credential and the query.
     """
     text = str(url or "").strip()
     parsed = urllib.parse.urlsplit(text)
@@ -798,6 +947,14 @@ def split_endpoint_credentials(url: str) -> Tuple[str, str]:
     ``model=``); the first userinfo/query credential is returned for the
     documented ``PAPER_AGENT_MODEL_API_KEY`` channel.  A URL with no
     credential is returned unchanged with an empty secret.
+
+    Example:
+        ``split_endpoint_credentials("https://user:pw@host/v1?model=m")`` returns
+        the safe URL plus ``"pw"``.
+
+    Counterexample:
+        A URL without a credential returns the URL unchanged and an empty secret;
+        an empty secret is not an error.
     """
     text = str(url or "").strip()
     try:
@@ -856,6 +1013,14 @@ def endpoint_base(url: str) -> str:
     ``dsh_model_patch.yml``, so keeping ``user:password@`` there persisted a credential in an
     agent-readable artifact.  Endpoint credentials belong in ``--agent-model-api-key`` (or the
     provider environment variable), which the generated patch references by name.
+
+    Example:
+        ``endpoint_base("https://host/v1/chat/completions")`` returns
+        ``"https://host/v1"``.
+
+    Counterexample:
+        A URL with no host or a non-http scheme raises ``ConfigError``; it does not
+        return the input unchanged.
     """
     text = str(url or "").strip()
     try:
@@ -913,6 +1078,13 @@ def endpoint_credentials(url: str) -> str:
     both rejected before a run: neither can be honoured by the generated DSH
     patch (which carries no query string) and both would be written to the run
     record.  A non-secret query parameter such as ``?model=`` stays allowed.
+
+    Example:
+        ``endpoint_credentials("https://host/v1?api_key=x")`` returns
+        ``"query parameter 'api_key'"``.
+
+    Counterexample:
+        ``?model=x`` is not a credential and returns ``""``.
     """
     try:
         parsed = urllib.parse.urlsplit(str(url or "").strip())
@@ -934,6 +1106,19 @@ def endpoint_credentials(url: str) -> str:
 
 
 def endpoint_query_model(url: str) -> str:
+    """The ``model=`` query value of an endpoint URL, or ``""``.
+
+    The value is a hint for the provider model id; ``--agent-model-name`` (or
+    an explicit raw model) still wins elsewhere.
+
+    Example:
+        ``endpoint_query_model("https://host/v1?model=qwen")`` returns
+        ``"qwen"``.
+
+    Counterexample:
+        A malformed URL or a missing ``model`` key returns ``""``; this helper
+        does not raise for a bad URL.
+    """
     try:
         values = urllib.parse.parse_qs(urllib.parse.urlsplit(str(url)).query)
     except ValueError:
@@ -1010,6 +1195,14 @@ def resolve_endpoint_model(
     ``--agent-model-name`` wins; a ``?model=`` query parameter is next; then a
     single model listed by ``/v1/models``; otherwise ``default`` (a keyless
     local proxy commonly serves only one model but exposes no listing).
+
+    Example:
+        A URL plus ``--agent-model-name`` returns that name; a URL with ``?model=``
+        falls back to the query value.
+
+    Counterexample:
+        A named (non-URL) model returns an empty resolution; do not call this for
+        catalog models.
     """
     if selection.model_name:
         if not probe:
@@ -1049,6 +1242,14 @@ def deep_merge(base: Dict[str, Any], override: Mapping[str, Any]) -> Dict[str, A
     is merged key by key; any other value (including a list or a scalar)
     replaces the default.  This is the ``--agent-model-prep-json`` contract: an
     incomplete object is valid because it only overrides the keys it carries.
+
+    Example:
+        ``deep_merge({"a":{"b":1}}, {"a":{"c":2}})`` yields
+        ``{"a":{"b":1,"c":2}}``.
+
+    Counterexample:
+        A list or scalar override replaces the whole value; it is not appended or
+        merged element-wise.
     """
     for key, value in (override or {}).items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):
@@ -1059,7 +1260,16 @@ def deep_merge(base: Dict[str, Any], override: Mapping[str, Any]) -> Dict[str, A
 
 
 def parse_prep_json(value: Any) -> Dict[str, Any]:
-    """A JSON object for ``--agent-model-prep-json`` (an empty value is ``{}``)."""
+    """A JSON object for ``--agent-model-prep-json`` (an empty value is ``{}``).
+
+    Example:
+        ``parse_prep_json('{"temperature":0}')`` returns
+        ``{"temperature":0}``.
+
+    Counterexample:
+        A JSON array or invalid JSON raises ``ConfigError``; it never returns a
+        non-object.
+    """
     if value in (None, ""):
         return {}
     if isinstance(value, dict):
@@ -1191,6 +1401,14 @@ def start_prep_proxy(target_base: str, prep: Mapping[str, Any]) -> Tuple[str, st
 
     The returned base URL replaces the endpoint in the generated DSH patch; the
     proxy is otherwise transparent.  Only created when a prep object is present.
+
+    Example:
+        ``base, err = start_prep_proxy("https://host/v1", {"temperature":0})``
+        returns a loopback base URL.
+
+    Counterexample:
+        An empty prep object still starts a proxy if called directly; callers
+        should skip it when there is nothing to merge.
     """
     try:
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _PrepProxyHandler)
@@ -1213,6 +1431,13 @@ def stop_prep_proxy(server: Any = None) -> None:
 
     ``server`` may be the base URL returned by :func:`start_prep_proxy`; parallel
     verifier passes each stop only their own proxy.
+
+    Example:
+        ``stop_prep_proxy(base)`` stops the proxy for that base URL;
+        ``stop_prep_proxy()`` stops all this process started.
+
+    Counterexample:
+        Stopping an unknown base is a no-op; it does not raise.
     """
     with _PROXY_LOCK:
         if isinstance(server, str):
@@ -1244,6 +1469,12 @@ def compaction_proxy_target(
     ``--base-url`` override); the compaction route must share the regular
     provider's upstream rather than fall back to the environment-derived default
     while the regular provider uses the override.
+
+    Example:
+        A Dots selection returns its upstream base URL.
+
+    Counterexample:
+        A non-Dots selection returns ``""``; there is no proxy target to start.
     """
     if selection is None or selection.model is None:
         return ""
@@ -1259,7 +1490,16 @@ def compaction_proxy_target(
 def start_compaction_proxy(
     target_base: str, *, log_callback: Optional[Any] = None
 ) -> Tuple[Optional[Any], str]:
-    """Start the retrying proxy for the dots compaction route."""
+    """Start the retrying proxy for the dots compaction route.
+
+    Example:
+        ``start_compaction_proxy("https://dots/v1")`` returns ``(proxy, base)`` or
+        ``(None, "")`` on failure.
+
+    Counterexample:
+        It always uses the dedicated compaction name and retry policy; do not use
+        it as a general-purpose proxy for other providers.
+    """
     return start_retry_proxy(
         target_base,
         RETRY_SCHEDULE,
@@ -1269,7 +1509,16 @@ def start_compaction_proxy(
 
 
 def stop_compaction_proxy(proxy: Any = None) -> None:
-    """Stop one compaction proxy, or every one this process started."""
+    """Stop one compaction proxy, or every one this process started.
+
+    Example:
+        ``stop_compaction_proxy(proxy)`` stops one; ``stop_compaction_proxy()``
+        stops all.
+
+    Counterexample:
+        A ``None`` argument means "all", not "none"; pass the specific proxy if you
+        only want to stop one.
+    """
     stop_retry_proxy(proxy)
 
 
@@ -1392,6 +1641,14 @@ def selection_env(selection: Optional[AgentSelection]) -> Dict[str, str]:
     Values are injected into the child process only; they are never written to
     ``command.json`` or the run log.  dsh uses its own credential store for the
     native DeepSeek route, so only the adapter-backed families are listed.
+
+    Example:
+        A Dots selection returns ``DOTS_API_KEY`` and the compaction key variable
+        when configured.
+
+    Counterexample:
+        These values are child-process environment only; never persist this dict in
+        ``command.json``.
     """
     if selection is None or selection.model is None:
         return {}
@@ -1426,7 +1683,15 @@ def selection_env(selection: Optional[AgentSelection]) -> Dict[str, str]:
 def selection_problem(
     selection: Optional[AgentSelection], *, dry_run: bool = False
 ) -> str:
-    """A configuration problem that would fail the first real request ('' = none)."""
+    """A configuration problem that would fail the first real request ('' = none).
+
+    Example:
+        A Dots selection without ``DOTS_API_KEY`` returns a human-readable problem.
+
+    Counterexample:
+        ``dry_run=True`` returns ``""`` by design; absence of a problem in dry-run
+        does not mean the live request will work.
+    """
     if selection is None or selection.model is None:
         return ""
     settings = _provider_family_settings(selection)
@@ -1472,6 +1737,14 @@ def dsh_patch_text(
     harness with the ``default`` sentinel; only the bare sentinel owns no model at all.  A
     provider-only override has no profile model id available here, and a patch layer replaces
     the whole entry config, so it must not pin the sentinel as the provider's model either.
+
+    Example:
+        A Dots selection returns the ``llm-pi-ai`` provider patch plus the
+        compaction route.
+
+    Counterexample:
+        ``selection.is_default`` with no raw model returns ``""`` (no patch); do
+        not write an empty patch file.
     """
     if selection.is_default and not raw_model:
         return ""
@@ -1612,7 +1885,15 @@ def dsh_patch_text(
 def codex_provider_args(
     selection: AgentSelection, *, raw_model: Optional[str] = None
 ) -> List[str]:
-    """The ``-c`` overrides that select the provider for ``codex exec``."""
+    """The ``-c`` overrides that select the provider for ``codex exec``.
+
+    Example:
+        A Qwen selection returns ``-c`` provider arguments for ``codex exec``.
+
+    Counterexample:
+        A custom endpoint raises ``ConfigError``; Codex cannot speak the
+        chat-completions URL directly.
+    """
     if selection.model is None or selection.is_default:
         return []
     settings = _provider_family_settings(selection)
@@ -1706,7 +1987,16 @@ def _codex_config(name: str, value: Any) -> str:
 def claude_model_arg(
     selection: AgentSelection, *, raw_model: Optional[str] = None
 ) -> Optional[str]:
-    """The ``--model`` value for Claude Code (``None`` = its configured model)."""
+    """The ``--model`` value for Claude Code (``None`` = its configured model).
+
+    Example:
+        A Claude selection returns its alias/id; a DeepSeek/Qwen/Dots selection
+        returns the raw override or ``None``.
+
+    Counterexample:
+        ``None`` means "let Claude Code use its configured model"; it is not an
+        error.
+    """
     if selection.model is None or selection.is_default:
         return None
     family = _normalized_family(selection)
@@ -1722,7 +2012,16 @@ def claude_model_arg(
 def claude_environment(
     selection: Optional[AgentSelection], *, raw_model: Optional[str] = None
 ) -> Dict[str, str]:
-    """Environment overrides that point Claude Code at the selected provider."""
+    """Environment overrides that point Claude Code at the selected provider.
+
+    Example:
+        A Dots selection returns ``ANTHROPIC_BASE_URL`` and the model aliases for
+        Claude Code.
+
+    Counterexample:
+        A GPT/Claude/endpoint selection returns ``{}``; the function does not
+        invent an Anthropic route for an unsupported family.
+    """
     if selection is None or selection.model is None or selection.is_default:
         return {}
     settings = _provider_family_settings(selection)
@@ -1814,6 +2113,13 @@ def effective_agent_model(cmd: Sequence[Any]) -> Dict[str, Any]:
     selection directly.  It understands the native provider-adapter spelling
     (``--harness/--model`` and ``--endpoint/--model-name``), ``codex exec -m``
     and ``claude --model``.
+
+    Example:
+        A named selection returns a secret-free record with the provider id.
+
+    Counterexample:
+        An endpoint record contains only the redacted URL and an ``api_key_set``
+        boolean; the key itself is never present.
     """
     argv = [str(item) for item in (cmd or [])]
     exe = os.path.basename(argv[0]).lower() if argv else ""
@@ -1872,6 +2178,14 @@ def redact_prep_object(value: Any) -> Any:
 
     Request defaults such as ``max_tokens`` or ``max_completion_tokens`` are
     ordinary generation parameters, not credentials, so they stay readable.
+
+    Example:
+        ``redact_prep_object({"api_key":{"value":"sk-live"}})`` returns
+        ``{"api_key":"[REDACTED]"}``.
+
+    Counterexample:
+        A non-secret key such as ``max_tokens`` stays readable; do not redact whole
+        request objects.
     """
     if isinstance(value, dict):
         result = {}

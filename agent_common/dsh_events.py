@@ -21,7 +21,15 @@ FAILURE_KINDS = frozenset({"error", "failed"})
 
 
 def parse_event(line: Any) -> Optional[dict]:
-    """The JSON object on one NDJSON line, or ``None`` for a non-event line."""
+    """The JSON object on one NDJSON line, or ``None`` for a non-event line.
+
+    Example:
+        ``parse_event(b'{"type":"status","phase":"turn_end"}')`` returns the dict.
+
+    Counterexample:
+        A JSON array or a plain text line returns ``None``; "not an event" must not
+        be treated as a completed turn.
+    """
     if isinstance(line, bytes):
         try:
             text = line.decode("utf-8")
@@ -40,7 +48,16 @@ def parse_event(line: Any) -> Optional[dict]:
 
 
 def is_turn_end(event: Any) -> bool:
-    """Whether ``event`` is one of the two turn-end shapes dsh has emitted."""
+    """Whether ``event`` is one of the two turn-end shapes dsh has emitted.
+
+    Example:
+        Both ``{"type":"turn_end"}`` and
+        ``{"type":"status","phase":"turn_end"}`` return ``True``.
+
+    Counterexample:
+        A ``text`` or ``session`` event returns ``False``; this is a turn-end
+        check, not a generic JSON-event check.
+    """
     if not isinstance(event, Mapping):
         return False
     phase = str(event.get("phase") or "").lower()
@@ -50,7 +67,16 @@ def is_turn_end(event: Any) -> bool:
 
 
 def turn_end_failed(event: Any) -> Optional[bool]:
-    """``True``/``False`` for a turn-end event, ``None`` for every other event."""
+    """``True``/``False`` for a turn-end event, ``None`` for every other event.
+
+    Example:
+        A turn-end with ``status="error"`` or ``reason.kind="error"`` returns
+        ``True``; an ``ok`` turn returns ``False``.
+
+    Counterexample:
+        A non-turn-end event returns ``None``, not ``False``; callers must handle
+        the three-valued result.
+    """
     if not is_turn_end(event):
         return None
     assert isinstance(event, Mapping)
@@ -70,7 +96,16 @@ def turn_end_failed(event: Any) -> Optional[bool]:
 
 
 def line_turn_end_failed(line: Any) -> Optional[bool]:
-    """``turn_end_failed`` for one raw NDJSON line."""
+    """``turn_end_failed`` for one raw NDJSON line.
+
+    Example:
+        ``line_turn_end_failed(b'{"type":"turn_end","status":"ok"}')`` returns
+        ``False``.
+
+    Counterexample:
+        A malformed or truncated line returns ``None``; an unparsable completion
+        must not become a success.
+    """
     event = parse_event(line)
     if event is None:
         return None
@@ -78,7 +113,15 @@ def line_turn_end_failed(line: Any) -> Optional[bool]:
 
 
 def turn_end_error(reason: Any) -> str:
-    """Message of a dsh turn-end reason that describes an error, else ``""``."""
+    """Message of a dsh turn-end reason that describes an error, else ``""``.
+
+    Example:
+        ``turn_end_error({"kind":"error","error":{"message":"boom"}}) == "boom"``.
+
+    Counterexample:
+        A non-error reason such as ``{"kind":"completed"}`` returns ``""``; the
+        caller adds its own fallback text.
+    """
     if not isinstance(reason, Mapping):
         return ""
     if reason.get("kind") != "error" and not reason.get("error"):

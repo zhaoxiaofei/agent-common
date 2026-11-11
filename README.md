@@ -82,6 +82,12 @@ git commit -m "Update agent-common"
 `sync_llm_policy.sh` and `update_model_catalog.sh` are kept as convenience
 wrappers that check out the pinned submodule commit in all three checkouts.
 
+## Public API and documentation
+
+See [`API.md`](API.md) for the supported imports and usage recipes.  Every
+public function and method has a docstring with an `Example` and a
+`Counterexample`, enforced by `test_public_api_docs.py`.
+
 ## Verification
 
 ```bash
