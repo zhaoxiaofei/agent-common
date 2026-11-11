@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from agent_common import llm_retry, model_runtime
 
@@ -155,6 +157,104 @@ class DefaultReasoningLevelTests(unittest.TestCase):
         )
         self.assertIn("reasoningEfforts: false", overlay)
         self.assertNotIn("    reasoningEffort: ", overlay)
+
+
+class ReasoningEffortOverrideTests(unittest.TestCase):
+    """The shared --reasoning-effort override reaches every family."""
+
+    def selection(self, model, harness="dsh"):
+        return model_runtime.resolve_agent_selection(harness=harness, model=model)
+
+    def with_override(self, level):
+        return mock.patch.dict(
+            os.environ, {"PAPER_AGENT_REASONING_EFFORT": level}
+        )
+
+    def test_the_override_wins_and_maps_to_each_family(self):
+        with self.with_override("medium"):
+            self.assertEqual(model_runtime.reasoning_effort_override(), "medium")
+            deepseek = model_runtime.dsh_patch_text(
+                self.selection("deepseek-flash")
+            )
+            self.assertIn('reasoningEffort: "high"', deepseek)
+            qwen = model_runtime.dsh_patch_text(self.selection("qwen38-27b"))
+            self.assertIn('reasoningEffort: "medium"', qwen)
+            dots = model_runtime.dsh_patch_text(
+                self.selection("dots3-note-preview")
+            )
+            self.assertIn('reasoningEffort: "medium"', dots)
+        with self.with_override("max"):
+            qwen = model_runtime.dsh_patch_text(self.selection("qwen38-27b"))
+            self.assertIn('reasoningEffort: "xhigh"', qwen)
+
+    def test_off_is_expressed_by_every_route(self):
+        with self.with_override("off"):
+            deepseek = model_runtime.dsh_patch_text(
+                self.selection("deepseek-flash")
+            )
+            self.assertIn('reasoningEffort: "off"', deepseek)
+            qwen = model_runtime.dsh_patch_text(self.selection("qwen38-27b"))
+            self.assertIn('reasoningEffort: "off"', qwen)
+            self.assertIn('              "off":', qwen)
+            dots = model_runtime.dsh_patch_text(
+                self.selection("dots3-note-preview")
+            )
+            self.assertIn("reasoningEfforts: false", dots)
+            self.assertNotIn('    reasoningEffort: "', dots)
+
+    def test_gpt_and_claude_receive_the_override_on_every_route(self):
+        with self.with_override("high"):
+            gpt = model_runtime.dsh_patch_text(self.selection("gpt-sol"))
+            self.assertIn('reasoningEffort: "high"', gpt)
+            claude = model_runtime.dsh_patch_text(
+                self.selection("claude-opus")
+            )
+            self.assertIn('reasoningEffort: "high"', claude)
+            codex = model_runtime.codex_provider_args(
+                self.selection("gpt-sol", harness="gpt-codex")
+            )
+            self.assertIn('model_reasoning_effort="high"', codex)
+            env = model_runtime.claude_environment(
+                self.selection("claude-opus", harness="claude-code")
+            )
+            self.assertEqual(env["CLAUDE_CODE_EFFORT_LEVEL"], "high")
+            # A config-owned model still receives the codex level.
+            owned = model_runtime.codex_provider_args(
+                self.selection("default", harness="gpt-codex")
+            )
+            self.assertIn('model_reasoning_effort="high"', owned)
+
+    def test_the_override_is_carried_in_the_child_environment(self):
+        with self.with_override("low"):
+            env = model_runtime.selection_env(
+                self.selection("deepseek-flash")
+            )
+        self.assertEqual(env["PAPER_AGENT_REASONING_EFFORT"], "low")
+
+    def test_none_is_off_and_an_unknown_level_is_an_error(self):
+        with self.with_override("none"):
+            self.assertEqual(model_runtime.reasoning_effort_override(), "off")
+        with self.with_override("turbo"):
+            with self.assertRaises(model_runtime.ConfigError):
+                model_runtime.reasoning_effort_override()
+            with self.assertRaises(model_runtime.ConfigError):
+                model_runtime.normalize_reasoning_effort("deepseek-flash", "turbo")
+
+    def test_normalization_is_the_one_translation_table(self):
+        self.assertEqual(
+            model_runtime.normalize_reasoning_effort("deepseek-flash", "medium"),
+            "high",
+        )
+        self.assertEqual(
+            model_runtime.normalize_reasoning_effort("qwen38-27b", "max"), "xhigh"
+        )
+        self.assertEqual(
+            model_runtime.normalize_reasoning_effort("dots3-note-preview", "medium"),
+            "medium",
+        )
+        self.assertEqual(
+            model_runtime.normalize_reasoning_effort("gpt-sol", "xhigh"), "xhigh"
+        )
 
 
 if __name__ == "__main__":

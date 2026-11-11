@@ -113,6 +113,17 @@ send a field those endpoints do not document.
 `PAPER_QWEN_REASONING_EFFORT`) still wins; `none`/`off` turns Dots thinking
 off by disabling effort selection.
 
+A consumer's `--reasoning-effort LEVEL` (gdp, paper-refine and
+paper-refine-eval all provide one) exports `PAPER_AGENT_REASONING_EFFORT`
+(`GDP_AGENT_REASONING_EFFORT` is an alias), which overrides every family —
+including GPT and Claude, whose default is otherwise the model's own.  The
+vocabulary is `off|minimal|low|medium|high|xhigh|max` (`none` is accepted for
+`off`), and a family that does not document a level uses its nearest one:
+DeepSeek's `medium`→`high`; Qwen's `high` and `max`→`xhigh`.  The one table is
+`model_runtime.normalize_reasoning_effort(model, level)`; an unknown level is
+an error, never a silent fallback.  The per-family variables remain as
+narrower overrides for a consumer that does not expose the flag.
+
 **Every common model setting lives here.**  Context windows, the harness
 output cap, the single-shot chat cap, the default reasoning level, the base
 URLs and the model ids are defined in this repository, and a consumer reads

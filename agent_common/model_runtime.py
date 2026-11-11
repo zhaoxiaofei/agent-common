@@ -497,6 +497,29 @@ AGENT_MODEL_ENV_ALIASES: Tuple[str, ...] = (
     "GDP_AGENT_MODEL",
 )
 
+#: Operator override for the reasoning level of whichever model a selection
+#: names.  It wins over the per-family variables (``PAPER_QWEN_...`` etc.) and
+#: the catalog default, and it is the only override that also reaches GPT and
+#: Claude, whose default is the model's own.  A consumer's
+#: ``--reasoning-effort`` flag exports this; ``none`` is accepted as a spelling
+#: of ``off``.  The vocabulary is the union the harnesses understand; a family
+#: that lacks a level uses its nearest documented one (see
+#: :func:`normalize_reasoning_effort`).
+AGENT_REASONING_EFFORT_ENV = "PAPER_AGENT_REASONING_EFFORT"
+AGENT_REASONING_EFFORT_ENV_ALIASES: Tuple[str, ...] = (
+    "PAPER_AGENT_REASONING_EFFORT",
+    "GDP_AGENT_REASONING_EFFORT",
+)
+REASONING_EFFORT_LEVELS: Tuple[str, ...] = (
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
+
 DEFAULT_ENDPOINT_CONTEXT = 32768
 DEFAULT_ENDPOINT_MAX_TOKENS = 8192
 
@@ -507,6 +530,95 @@ def _first_env(names: Iterable[str], default: str = "") -> str:
         if value not in (None, ""):
             return value
     return default
+
+
+def reasoning_effort_override() -> Optional[str]:
+    """The operator's explicit reasoning level for the selected model, or None.
+
+    A consumer's ``--reasoning-effort`` flag exports
+    ``PAPER_AGENT_REASONING_EFFORT`` (``GDP_AGENT_REASONING_EFFORT`` is an
+    alias).  The value wins over the per-family variables and the catalog
+    default, for every family, including GPT and Claude (whose default is the
+    model's own).  ``none`` is accepted as a spelling of ``off``.
+
+    Example:
+        With ``PAPER_AGENT_REASONING_EFFORT=high`` it returns ``"high"``; with
+        the variable unset it returns ``None`` and the catalog default applies.
+
+    Counterexample:
+        An unknown value raises ``ConfigError`` instead of being dropped: the
+        harnesses accept different vocabularies, so a misspelling must fail
+        before a run rather than produce an invalid provider config.
+    """
+    value = _first_env(AGENT_REASONING_EFFORT_ENV_ALIASES).strip().lower()
+    if not value:
+        return None
+    if value == "none":
+        return "off"
+    if value not in REASONING_EFFORT_LEVELS:
+        raise ConfigError(
+            "unknown reasoning effort %r; use one of %s"
+            % (value, ", ".join(REASONING_EFFORT_LEVELS))
+        )
+    return value
+
+
+#: How each family's wire spells a generic level.  A level the family does not
+#: document maps onto its nearest one, so one operator flag works everywhere:
+#: DeepSeek has no ``medium`` (it maps to ``high``) and Qwen has no ``high`` or
+#: ``max`` (both map to its highest level, ``xhigh``).  Dots has a single
+#: thinking level and GPT/Claude are validated by the harness, so their values
+#: pass through unchanged.
+_EFFORT_WIRE_LEVELS: Dict[str, Dict[str, str]] = {
+    "deepseek": {
+        "off": "off",
+        "minimal": "low",
+        "low": "low",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "max",
+        "max": "max",
+    },
+    "qwen": {
+        "off": "off",
+        "minimal": "low",
+        "low": "low",
+        "medium": "medium",
+        "high": "xhigh",
+        "xhigh": "xhigh",
+        "max": "xhigh",
+    },
+}
+
+
+def normalize_reasoning_effort(model: Any, level: str) -> str:
+    """Translate a generic reasoning level to the level a model's wire accepts.
+
+    The generic vocabulary is ``off|minimal|low|medium|high|xhigh|max``.  A
+    family that lacks a level uses its nearest documented one: DeepSeek has no
+    ``medium`` (it maps to ``high``) and Qwen has no ``high``/``max`` (both map
+    to its highest level, ``xhigh``).  Dots, GPT, Claude and a custom endpoint
+    pass the level through; their harness validates it.
+
+    Example:
+        ``normalize_reasoning_effort("deepseek-flash", "medium") == "high"``
+        and ``normalize_reasoning_effort("qwen38-27b", "max") == "xhigh"``.
+
+    Counterexample:
+        An unknown level raises ``ConfigError``; it is never silently replaced
+        by the catalog default, because the operator asked for something
+        specific.
+    """
+    text = str(level or "").strip().lower()
+    if text == "none":
+        text = "off"
+    if text not in REASONING_EFFORT_LEVELS:
+        raise ConfigError(
+            "unknown reasoning effort %r; use one of %s"
+            % (level, ", ".join(REASONING_EFFORT_LEVELS))
+        )
+    family = str((AGENT_MODELS.get(normalize_agent_model(model)) or {}).get("family") or "")
+    return (_EFFORT_WIRE_LEVELS.get(family) or {}).get(text, text)
 
 
 def agent_choice(value: Any) -> str:
@@ -1654,6 +1766,7 @@ def _normalized_family(selection: AgentSelection) -> str:
 
 def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
     """The endpoint, key and limits a provider family needs at request time."""
+    override = reasoning_effort_override()
     if selection.is_default:
         return {
             "family": "default",
@@ -1663,7 +1776,7 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
             "model": None,
             "context_window": None,
             "max_tokens": None,
-            "effort": None,
+            "effort": override,
         }
     family = _normalized_family(selection)
     if family == "endpoint":
@@ -1693,7 +1806,10 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
                 "PAPER_QWEN_CONTEXT_WINDOW", QWEN_CONTEXT_WINDOW
             ),
             "max_tokens": _int_env("PAPER_QWEN_MAX_TOKENS", QWEN_MAX_TOKENS),
-            "effort": _env("PAPER_QWEN_REASONING_EFFORT", QWEN_DEFAULT_EFFORT).lower(),
+            "effort": normalize_reasoning_effort(
+                "qwen38-27b",
+                override or _env("PAPER_QWEN_REASONING_EFFORT", QWEN_DEFAULT_EFFORT),
+            ),
         }
     if family == "dots":
         compaction = dots_compaction(LLM_POLICY)
@@ -1714,7 +1830,11 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
                 "PAPER_DOTS_CONTEXT_WINDOW", DOTS_CONTEXT_WINDOW
             ),
             "max_tokens": _int_env("PAPER_DOTS_MAX_TOKENS", DOTS_MAX_TOKENS),
-            "effort": _env("PAPER_DOTS_REASONING_EFFORT", DOTS_DEFAULT_EFFORT).lower(),
+            "effort": normalize_reasoning_effort(
+                "dots3-note-preview",
+                override
+                or _env("PAPER_DOTS_REASONING_EFFORT", DOTS_DEFAULT_EFFORT),
+            ),
         }
     if family == "deepseek":
         info = selection.model_info()
@@ -1732,9 +1852,13 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
             # The catalog's default is named explicitly rather than left to
             # the adapter's own fallback, so a catalog revision is the only
             # place this level changes.
-            "effort": _env(
-                "PAPER_DEEPSEEK_REASONING_EFFORT", DEEPSEEK_DEFAULT_EFFORT
-            ).lower(),
+            "effort": normalize_reasoning_effort(
+                "deepseek-flash",
+                override
+                or _env(
+                    "PAPER_DEEPSEEK_REASONING_EFFORT", DEEPSEEK_DEFAULT_EFFORT
+                ),
+            ),
         }
     info = selection.model_info()
     return {
@@ -1745,9 +1869,9 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
         "model": selection.effective_model_id() or (selection.model or ""),
         "context_window": info.get("context_window"),
         "max_tokens": info.get("max_tokens"),
-        # A GPT or Claude selection names no effort: the harness/model default
-        # applies, exactly as the provider documents it.
-        "effort": None,
+        # GPT and Claude keep the model's own default unless the operator
+        # explicitly overrides it; then the harness receives that level.
+        "effort": override,
     }
 
 
@@ -1756,7 +1880,9 @@ def selection_env(selection: Optional[AgentSelection]) -> Dict[str, str]:
 
     Values are injected into the child process only; they are never written to
     ``command.json`` or the run log.  dsh uses its own credential store for the
-    native DeepSeek route, so only the adapter-backed families are listed.
+    native DeepSeek route, so only the adapter-backed families are listed.  An
+    explicit reasoning-effort override is carried too, so a nested adapter that
+    is handed this environment cannot fall back to the catalog default.
 
     Example:
         A Dots selection returns ``DOTS_API_KEY`` and the compaction key variable
@@ -1766,10 +1892,16 @@ def selection_env(selection: Optional[AgentSelection]) -> Dict[str, str]:
         These values are child-process environment only; never persist this dict in
         ``command.json``.
     """
-    if selection is None or selection.model is None:
-        return {}
-    settings = _provider_family_settings(selection)
     env: Dict[str, str] = {}
+    override = reasoning_effort_override()
+    if override:
+        # A consumer that builds a clean child environment carries the same
+        # explicit level the parent process applies, so a nested adapter cannot
+        # silently fall back to the catalog default.
+        env[AGENT_REASONING_EFFORT_ENV] = override
+    if selection is None or selection.model is None:
+        return env
+    settings = _provider_family_settings(selection)
     family = settings["family"]
     if family == "endpoint":
         key = settings["api_key"] or "dummy"
@@ -1940,6 +2072,8 @@ def dsh_patch_text(
             "            contextWindow: %s\n"
             "            maxTokens: %s\n"
             "            reasoningEfforts:\n"
+            # Quoted: an unquoted `off` is a YAML 1.1 boolean, not the level name.
+            "              \"off\":\n"
             "              low: low\n"
             "              medium: medium\n"
             "              xhigh: xhigh\n"
@@ -1961,7 +2095,14 @@ def dsh_patch_text(
                 ),
                 int(max_tokens_override or settings["max_tokens"] or QWEN_MAX_TOKENS),
                 json.dumps(model),
-                json.dumps(effort_override or settings["effort"] or QWEN_DEFAULT_EFFORT),
+                json.dumps(
+                    normalize_reasoning_effort(
+                        "qwen38-27b",
+                        effort_override
+                        or settings["effort"]
+                        or QWEN_DEFAULT_EFFORT,
+                    )
+                ),
             )
         )
     if family == "dots":
@@ -1985,9 +2126,10 @@ def dsh_patch_text(
         )
     if family == "deepseek":
         model = raw_model or selection.effective_model_id() or settings["model"]
-        effort = str(
-            effort_override or settings["effort"] or DEEPSEEK_DEFAULT_EFFORT
-        ).lower()
+        effort = normalize_reasoning_effort(
+            "deepseek-flash",
+            effort_override or settings["effort"] or DEEPSEEK_DEFAULT_EFFORT,
+        )
         # The native DeepSeek adapter serves ``high`` when the request names no
         # effort, so the catalog's default has to be written into the patch.
         return (
@@ -2012,17 +2154,21 @@ def dsh_patch_text(
         or info.get("dsh_provider")
         or ("openai" if family == "gpt" else "deepseek-official")
     )
-    # GPT and Claude keep the model's own default: the patch names no
-    # reasoningEffort, so the harness never overrides the model's choice.
-    return (
-        "# Generated by generic_debug_pipeline for this stage: --agent-model.\n"
-        "# A patch layer replaces the whole entry config, so the provider route is repeated.\n"
-        "- id: agent-default-model\n"
-        "  config:\n"
-        "    provider: %s\n"
-        "    model: %s\n"
-        % (json.dumps(provider), json.dumps(model))
-    )
+    # GPT and Claude keep the model's own default unless the operator named a
+    # level; naming it here is the one way the shared override reaches them.
+    lines = [
+        "# Generated by generic_debug_pipeline for this stage: --agent-model.",
+        "# A patch layer replaces the whole entry config, so the provider route is repeated.",
+        "- id: agent-default-model",
+        "  config:",
+        "    provider: %s" % json.dumps(provider),
+        "    model: %s" % json.dumps(model),
+    ]
+    if settings["effort"]:
+        lines.append(
+            "    reasoningEffort: %s" % json.dumps(str(settings["effort"]))
+        )
+    return "\n".join(lines) + "\n"
 
 
 def codex_provider_args(
@@ -2038,7 +2184,14 @@ def codex_provider_args(
         chat-completions URL directly.
     """
     if selection.model is None or selection.is_default:
-        return []
+        # The CLI owns the model, but an explicit level still reaches codex:
+        # `-c model_reasoning_effort` does not depend on the model id.
+        effort = reasoning_effort_override()
+        return (
+            ["-c", _codex_config("model_reasoning_effort", effort)]
+            if effort
+            else []
+        )
     settings = _provider_family_settings(selection)
     family = settings["family"]
     model = raw_model or selection.effective_model_id() or settings["model"]
@@ -2049,7 +2202,12 @@ def codex_provider_args(
     if family == "gpt":
         # The model choice owns the provider too: a Codex config repointed at
         # another provider must not redirect a GPT model.
-        return ["-c", _codex_config("model_provider", "openai")]
+        values = [_codex_config("model_provider", "openai")]
+        if settings["effort"]:
+            values.append(
+                _codex_config("model_reasoning_effort", settings["effort"])
+            )
+        return [item for pair in (["-c", value] for value in values) for item in pair]
     if family == "deepseek":
         values = [
             _codex_config("model_provider", "deepseek"),
@@ -2167,10 +2325,21 @@ def claude_environment(
         invent an Anthropic route for an unsupported family.
     """
     if selection is None or selection.model is None or selection.is_default:
-        return {}
+        # The CLI owns the model, but an explicit level still reaches Claude
+        # Code; Claude Code ignores a level outside its own vocabulary.
+        override = reasoning_effort_override()
+        return {"CLAUDE_CODE_EFFORT_LEVEL": override} if override else {}
     settings = _provider_family_settings(selection)
     family = settings["family"]
-    if family in ("claude", "gpt", "endpoint"):
+    if family in ("claude", "gpt"):
+        # Native Claude (and GPT over the harness) keep the model default
+        # unless the operator named a level.
+        return (
+            {"CLAUDE_CODE_EFFORT_LEVEL": str(settings["effort"])}
+            if settings["effort"]
+            else {}
+        )
+    if family == "endpoint":
         return {}
     root = str(settings["base_url"] or "").rstrip("/")
     if root.endswith("/v1"):
@@ -2199,7 +2368,7 @@ def claude_environment(
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "786432",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         }
-    return {
+    env = {
         "ANTHROPIC_BASE_URL": root,
         "ANTHROPIC_AUTH_TOKEN": key,
         "ANTHROPIC_API_KEY": key,
@@ -2209,6 +2378,12 @@ def claude_environment(
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     }
+    # Only an explicit operator override adds the effort: these
+    # Anthropic-compatible endpoints do not document the field, so the model's
+    # own default stays in place otherwise.
+    if reasoning_effort_override():
+        env["CLAUDE_CODE_EFFORT_LEVEL"] = str(settings["effort"])
+    return env
 
 
 _PREP_SECRET_KEYS = frozenset(

@@ -44,6 +44,8 @@ Key entry points:
 | `effective_agent_model` / `AgentSelection.to_record` | Secret-free run record. |
 | `default_reasoning_level` | The catalog default level for a named model (`None` when the model keeps its own default). |
 | `model_fact` | One catalog fact (context window, caps, default level) for a named model; the way a consumer reads a shared setting. |
+| `reasoning_effort_override` | The operator's `--reasoning-effort` value (from `PAPER_AGENT_REASONING_EFFORT`), or `None`. |
+| `normalize_reasoning_effort` | The generic level translated to the level a model's wire accepts. |
 | `endpoint_base` / `endpoint_query_model` / `endpoint_credentials` | Parse and validate custom endpoints. |
 | `redact_endpoint_url` / `redact_prep_object` | Remove credentials from recorded artifacts. |
 | `start_prep_proxy` / `stop_prep_proxy` | Merge a prep object into outgoing requests. |
@@ -68,6 +70,14 @@ consumer that only needs the number (for an adapter default, a log line or a
 documented table) should call these helpers instead of hard-coding a literal.
 `PAPER_DEEPSEEK_REASONING_EFFORT`, `PAPER_DOTS_REASONING_EFFORT` and
 `PAPER_QWEN_REASONING_EFFORT` remain operator overrides.
+
+`reasoning_effort_override()` returns the shared
+`PAPER_AGENT_REASONING_EFFORT` value (the channel a consumer's
+`--reasoning-effort` flag exports; `GDP_AGENT_REASONING_EFFORT` is an alias),
+and `normalize_reasoning_effort(model, level)` translates the generic
+`off|minimal|low|medium|high|xhigh|max` vocabulary to the level the model's
+wire accepts.  A consumer should set the environment variable (or pass the
+level through) rather than read a family-specific variable.
 
 Counterexample: `default_reasoning_level("gpt-sol") is None` is not an error;
 substituting `"high"` for it would override the model's own default.
