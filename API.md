@@ -28,7 +28,7 @@ selection = model_runtime.resolve_agent_selection(
 )
 patch_yaml = model_runtime.dsh_patch_text(selection)
 env = model_runtime.selection_env(selection)
-record = model_runtime.effective_agent_model(selection)
+record = selection.to_record()
 ```
 
 Key entry points:

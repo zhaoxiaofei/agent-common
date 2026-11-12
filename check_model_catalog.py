@@ -4,9 +4,9 @@
 Canonical file: ``repos/agent-common/agent_common/model_catalog.json``.  Each
 checkout mounts this repository as ``agent-common/``; run this after editing the catalog
 and committing it here.  It fails on a byte difference (a checkout's submodule
-drifted), an invalid capacity pair, or a `default_reasoning_level` that is not the
-documented policy (DeepSeek and Dots high, Qwen medium; GPT and Claude carry no
-level so their own default applies).
+drifted), an invalid capacity pair, a missing or unexpected model id, or a
+`default_reasoning_level` that is not the documented policy (DeepSeek and Dots
+high, Qwen medium; GPT and Claude carry no level so their own default applies).
 
     python3 repos/agent-common/check_model_catalog.py
 """
@@ -25,6 +25,21 @@ COPIES = [
     ROOT / "paper-refine-eval" / "agent-common" / "agent_common" / "model_catalog.json",
     ROOT / "paper-refine" / "agent-common" / "agent_common" / "model_catalog.json",
 ]
+
+#: The model ids the shared runtime's ``AGENT_MODELS`` table names.  A catalog
+#: that is missing one of these (or carries an extra one) is not the canonical
+#: catalog even when every entry it does contain is internally valid.
+EXPECTED_MODEL_IDS = frozenset(
+    {
+        "deepseek-flash",
+        "gpt-6.1-sol",
+        "gpt-6.1-terra",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "qwen3.8-27b",
+        "dots3-note-prev",
+    }
+)
 
 #: The reasoning level each deployment serves when the operator sets no
 #: override.  This is the policy the runtime and every harness read from the
@@ -127,6 +142,10 @@ def main() -> int:
             problems.append("missing copy: %s" % path)
         elif digest(path) != expected:
             problems.append("copy differs from canonical: %s" % path)
+    for model_id in sorted(EXPECTED_MODEL_IDS - seen):
+        problems.append("missing expected model id %s" % model_id)
+    for model_id in sorted(seen - EXPECTED_MODEL_IDS):
+        problems.append("unexpected model id %s" % model_id)
     if problems:
         for problem in problems:
             print("FAIL %s" % problem)

@@ -247,11 +247,16 @@ _MODEL_CATALOG_PATH = Path(__file__).with_name("model_catalog.json")
 
 
 def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
-    """Overwrite each model's capacities and default level from the shared catalog."""
+    """Overwrite each model's facts from the shared catalog, atomically.
+
+    Nothing is written until every model has been validated, so a later invalid
+    entry cannot leave an earlier model half-updated.
+    """
     try:
         with _MODEL_CATALOG_PATH.open(encoding="utf-8") as handle:
             document = json.load(handle)
         by_id = {entry["id"]: entry for entry in document["models"]}
+        pending: Dict[str, Dict[str, Any]] = {}
         for name, entry in models.items():
             facts = by_id.get(entry["id"])
             if facts is None:
@@ -267,8 +272,10 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
                     "context_window %d in %s"
                     % (name, max_tokens, context_window, _MODEL_CATALOG_PATH)
                 )
-            entry["context_window"] = context_window
-            entry["max_tokens"] = max_tokens
+            update: Dict[str, Any] = {
+                "context_window": context_window,
+                "max_tokens": max_tokens,
+            }
             chat_max_tokens = facts.get("chat_max_tokens")
             if chat_max_tokens is not None:
                 chat_max_tokens = int(chat_max_tokens)
@@ -288,10 +295,22 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
                             _MODEL_CATALOG_PATH,
                         )
                     )
-                entry["chat_max_tokens"] = chat_max_tokens
+                update["chat_max_tokens"] = chat_max_tokens
             default_level = facts.get("default_reasoning_level")
             if default_level:
-                entry["default_reasoning_level"] = str(default_level)
+                update["default_reasoning_level"] = str(default_level)
+            # The catalog is also the one source for the provider route: the
+            # runtime used to keep separate QWEN_/DOTS_ base-URL and key-env
+            # literals that a catalog edit could not reach.
+            if facts.get("provider"):
+                update["dsh_provider"] = str(facts["provider"])
+            if facts.get("base_url"):
+                update["base_url"] = str(facts["base_url"])
+            if facts.get("api_key_env"):
+                update["api_key_env"] = str(facts["api_key_env"])
+            pending[name] = update
+        for name, update in pending.items():
+            models[name].update(update)
     except FileNotFoundError as exc:
         # A checkout refreshed from upstream may not carry the catalog yet (the
         # adapter fallbacks below already document that case). Keep the table's
@@ -338,6 +357,10 @@ def reload_model_catalog() -> None:
         current catalog, so deliberate table edits survive.
     """
     _apply_model_catalog(AGENT_MODELS)
+    # The call sites read these module constants at request time; refreshing
+    # them here makes a successful reload visible instead of leaving the
+    # process on the import-time values.
+    _refresh_catalog_constants()
 
 
 AGENT_MODEL_CHOICES: Tuple[str, ...] = tuple(AGENT_MODELS) + (MODEL_DEFAULT,)
@@ -402,9 +425,13 @@ _HARNESS_ALIASES = {
     "claude": AGENT_HARNESS_CLAUDE_CODE,
 }
 
-#: Provider qwen serves its OpenAI-compatible route on by default.
-QWEN_DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
-QWEN_DEFAULT_MODEL = "qwen3.8-27b"
+#: Provider qwen serves its OpenAI-compatible route on by default.  The catalog
+#: owns the base URL/model/key-env fields; these names stay for callers that
+#: imported the old constants.
+QWEN_DEFAULT_BASE_URL = str(
+    AGENT_MODELS["qwen38-27b"].get("base_url") or "http://127.0.0.1:8000/v1"
+)
+QWEN_DEFAULT_MODEL = str(AGENT_MODELS["qwen38-27b"].get("id") or "qwen3.8-27b")
 QWEN_DEFAULT_API_KEY = "dummy"
 #: The reasoning level each provider family serves when the operator sets no
 #: override.  The shared catalog's ``default_reasoning_level`` is authoritative
@@ -422,8 +449,13 @@ DOTS_DEFAULT_EFFORT = str(
 DEEPSEEK_DEFAULT_EFFORT = str(
     AGENT_MODELS["deepseek-flash"].get("default_reasoning_level") or "high"
 )
-DOTS_DEFAULT_BASE_URL = "https://note3-prev-api.askdiandian.com/v1"
-DOTS_DEFAULT_MODEL = "dots3-note-prev"
+DOTS_DEFAULT_BASE_URL = str(
+    AGENT_MODELS["dots3-note-preview"].get("base_url")
+    or "https://note3-prev-api.askdiandian.com/v1"
+)
+DOTS_DEFAULT_MODEL = str(
+    AGENT_MODELS["dots3-note-preview"].get("id") or "dots3-note-prev"
+)
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "recursive/flint-v1.0:free"
 OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
@@ -466,6 +498,52 @@ API_PROVIDER_DEFAULTS: Dict[str, Dict[str, Optional[str]]] = {
         "api_key": None,
     },
 }
+
+
+def _refresh_catalog_constants() -> None:
+    """Recompute the exported catalog-derived constants after a reload."""
+    global QWEN_CONTEXT_WINDOW, QWEN_MAX_TOKENS, QWEN_CHAT_MAX_TOKENS
+    global DOTS_CONTEXT_WINDOW, DOTS_MAX_TOKENS, DOTS_CHAT_MAX_TOKENS
+    global DEEPSEEK_CONTEXT_WINDOW, DEEPSEEK_MAX_TOKENS, DEEPSEEK_CHAT_MAX_TOKENS
+    global QWEN_DEFAULT_BASE_URL, QWEN_DEFAULT_MODEL
+    global DOTS_DEFAULT_BASE_URL, DOTS_DEFAULT_MODEL
+    global QWEN_DEFAULT_EFFORT, DOTS_DEFAULT_EFFORT, DEEPSEEK_DEFAULT_EFFORT
+
+    QWEN_CONTEXT_WINDOW = int(AGENT_MODELS["qwen38-27b"]["context_window"])
+    QWEN_MAX_TOKENS = int(AGENT_MODELS["qwen38-27b"]["max_tokens"])
+    QWEN_CHAT_MAX_TOKENS = int(AGENT_MODELS["qwen38-27b"]["chat_max_tokens"])
+    DOTS_CONTEXT_WINDOW = int(AGENT_MODELS["dots3-note-preview"]["context_window"])
+    DOTS_MAX_TOKENS = int(AGENT_MODELS["dots3-note-preview"]["max_tokens"])
+    DOTS_CHAT_MAX_TOKENS = int(AGENT_MODELS["dots3-note-preview"]["chat_max_tokens"])
+    DEEPSEEK_CONTEXT_WINDOW = int(AGENT_MODELS["deepseek-flash"]["context_window"])
+    DEEPSEEK_MAX_TOKENS = int(AGENT_MODELS["deepseek-flash"]["max_tokens"])
+    DEEPSEEK_CHAT_MAX_TOKENS = int(AGENT_MODELS["deepseek-flash"]["chat_max_tokens"])
+    QWEN_DEFAULT_BASE_URL = str(
+        AGENT_MODELS["qwen38-27b"].get("base_url") or "http://127.0.0.1:8000/v1"
+    )
+    QWEN_DEFAULT_MODEL = str(
+        AGENT_MODELS["qwen38-27b"].get("id") or "qwen3.8-27b"
+    )
+    DOTS_DEFAULT_BASE_URL = str(
+        AGENT_MODELS["dots3-note-preview"].get("base_url")
+        or "https://note3-prev-api.askdiandian.com/v1"
+    )
+    DOTS_DEFAULT_MODEL = str(
+        AGENT_MODELS["dots3-note-preview"].get("id") or "dots3-note-prev"
+    )
+    QWEN_DEFAULT_EFFORT = str(
+        AGENT_MODELS["qwen38-27b"].get("default_reasoning_level") or "medium"
+    )
+    DOTS_DEFAULT_EFFORT = str(
+        AGENT_MODELS["dots3-note-preview"].get("default_reasoning_level") or "high"
+    )
+    DEEPSEEK_DEFAULT_EFFORT = str(
+        AGENT_MODELS["deepseek-flash"].get("default_reasoning_level") or "high"
+    )
+    API_PROVIDER_DEFAULTS["qwen"]["base_url"] = QWEN_DEFAULT_BASE_URL
+    API_PROVIDER_DEFAULTS["qwen"]["model"] = QWEN_DEFAULT_MODEL
+    API_PROVIDER_DEFAULTS["dots"]["base_url"] = DOTS_DEFAULT_BASE_URL
+    API_PROVIDER_DEFAULTS["dots"]["model"] = DOTS_DEFAULT_MODEL
 
 #: One name per shared agent knob: the key the generated provider config names
 #: for a custom endpoint, the model/name/prep request options, and the harness
@@ -762,6 +840,21 @@ def default_reasoning_level(model: Any) -> Optional[str]:
     return str(level) if level else None
 
 
+def _canonical_harness(value: Any) -> Any:
+    """Resolve an operator harness spelling without validating/raising."""
+    if not value:
+        return value
+    name = agent_choice(value)
+    return _HARNESS_ALIASES.get(name, name)
+
+
+def _canonical_model(value: Any) -> Any:
+    """Resolve a model alias without validating/raising."""
+    if not value:
+        return value
+    return normalize_agent_model(value)
+
+
 def agent_pair_supported(harness: str, model: Optional[str]) -> bool:
     """Can ``harness`` reach ``model`` over a protocol it speaks?
 
@@ -772,6 +865,8 @@ def agent_pair_supported(harness: str, model: Optional[str]) -> bool:
         ``agent_pair_supported("claude-code", "gpt-sol")`` is ``False``; the two
         axes are not freely interchangeable.
     """
+    harness = _canonical_harness(harness)
+    model = _canonical_model(model) if model is not None else None
     if model == MODEL_DEFAULT:
         return True
     if model is None:
@@ -798,6 +893,7 @@ def agent_model_for_harness(harness: str) -> str:
         An unknown harness falls back to the global default model rather than
         raising; validate the harness first if that matters.
     """
+    harness = _canonical_harness(harness) or harness
     return (AGENT_HARNESSES.get(harness) or {}).get(
         "default_model", DEFAULT_AGENT_MODEL
     )
@@ -813,6 +909,7 @@ def agent_harness_for_model(model: str) -> str:
         A custom endpoint always maps to ``dsh``; do not infer ``codex`` from the
         URL's model name.
     """
+    model = _canonical_model(model) if model else model
     if model == MODEL_DEFAULT:
         return DEFAULT_AGENT_HARNESS
     if agent_model_is_endpoint(model):
@@ -862,6 +959,10 @@ def pair_from_options(
         Empty inputs use the fallback/default pair; the function does not return
         ``(None, None)``.
     """
+    harness = _canonical_harness(harness)
+    model = _canonical_model(model) if model else model
+    fallback_harness = _canonical_harness(fallback_harness)
+    fallback_model = _canonical_model(fallback_model) if fallback_model else fallback_model
     if not harness and not model:
         resolved_harness = fallback_harness or DEFAULT_AGENT_HARNESS
         resolved_model = fallback_model or agent_model_for_harness(resolved_harness)
@@ -895,7 +996,9 @@ class AgentSelection:
     harness: str
     model: Optional[str] = None
     legacy: Optional[str] = None
-    api_key: Optional[str] = None
+    # Never print the live key from the auto-generated repr; to_record() is the
+    # one explicit serialiser and it reports only api_key_set.
+    api_key: Optional[str] = field(default=None, repr=False)
     model_name: Optional[str] = None
     prep_json: Mapping[str, Any] = field(default_factory=dict)
 
@@ -1182,13 +1285,72 @@ def split_endpoint_credentials(url: str) -> Tuple[str, str]:
     )
 
 
+#: Credential-looking names, compared after lowercasing and dropping every
+#: non-alphanumeric character.  This is the one predicate shared by the query
+#: splitter, the endpoint validator and the prep-object redactor, so a spelling
+#: cannot be a credential in one path and an ordinary parameter in another.
+_CREDENTIAL_KEY_NAMES = frozenset(
+    {
+        "key",
+        "apikey",
+        "apikeys",
+        "xapikey",
+        "token",
+        "tokens",
+        "accesstoken",
+        "accesstokens",
+        "authtoken",
+        "authtokens",
+        "apitoken",
+        "apitokens",
+        "secret",
+        "secrets",
+        "secretkey",
+        "secretkeys",
+        "privatekey",
+        "privatekeys",
+        "clientsecret",
+        "clientsecrets",
+        "password",
+        "passwd",
+        "credential",
+        "credentials",
+        "authorization",
+        "auth",
+        "bearer",
+        "accesskey",
+        "accesskeys",
+        "accesskeyid",
+        "subscriptionkey",
+    }
+)
+_CREDENTIAL_KEY_SUFFIXES = (
+    "_key",
+    "_token",
+    "_secret",
+    "_password",
+    "_passwd",
+    "_credential",
+    "_credentials",
+    "_authorization",
+    "_auth",
+    "_apikey",
+)
+
+
+def _credential_key(name: Any) -> bool:
+    """Whether a query/prep key looks like it carries a credential."""
+    text = str(name or "").strip().lower()
+    compact = "".join(character for character in text if character.isalnum())
+    if compact in _CREDENTIAL_KEY_NAMES:
+        return True
+    normalized = text.replace("-", "_").replace(" ", "_")
+    return normalized.endswith(_CREDENTIAL_KEY_SUFFIXES)
+
+
 def _secret_query_key(name: str) -> bool:
-    """Whether a query parameter name looks like a credential."""
-    upper = str(name).upper().replace("-", "_")
-    return any(
-        upper == marker or upper.endswith("_" + marker)
-        for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
-    )
+    """Backward-compatible spelling of :func:`_credential_key` for query names."""
+    return _credential_key(name)
 
 
 def endpoint_base(url: str) -> str:
@@ -1213,26 +1375,37 @@ def endpoint_base(url: str) -> str:
     """
     text = str(url or "").strip()
     try:
+        safe = redact_endpoint_url(text)
+    except ValueError:
+        # ``urlsplit`` cannot parse some malformed URLs (an unmatched ``[``
+        # raises "Invalid IPv6 URL"), and the redactor uses it too.  Strip the
+        # credential-bearing parts textually so the ConfigError below stays
+        # credential-free and the documented exception type is preserved.
+        safe = text.split("#", 1)[0].split("?", 1)[0]
+        if "://" in safe:
+            scheme, _, remainder = safe.partition("://")
+            safe = scheme + "://" + remainder.rsplit("@", 1)[-1]
+    try:
         parsed = urllib.parse.urlsplit(text)
         host = parsed.hostname
         parsed.port          # a non-numeric or out-of-range port is malformed too
     except ValueError:
         raise ConfigError(
-            "--agent-model endpoint %r is not an http(s) URL with a host" % text
+            "--agent-model endpoint %r is not an http(s) URL with a host" % safe
         ) from None
     if parsed.scheme not in ("http", "https") or not host:
         raise ConfigError(
-            "--agent-model endpoint %r is not an http(s) URL with a host" % text
+            "--agent-model endpoint %r is not an http(s) URL with a host" % safe
         )
     try:
         port = parsed.port
     except ValueError as exc:
         raise ConfigError(
-            "--agent-model endpoint %r has an invalid port: %s" % (text, exc)
+            "--agent-model endpoint %r has an invalid port: %s" % (safe, exc)
         ) from None
     if port is not None and not 0 < port <= 65535:
         raise ConfigError(
-            "--agent-model endpoint %r has an invalid port: %d" % (text, port)
+            "--agent-model endpoint %r has an invalid port: %d" % (safe, port)
         )
     path = parsed.path.rstrip("/")
     if path.endswith("/chat/completions"):
@@ -1241,23 +1414,10 @@ def endpoint_base(url: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, netloc, path, "", ""))
 
 
-#: Query keys that carry a credential.  The endpoint's key belongs in
-#: ``--agent-model-api-key`` / the key environment variable, not in the URL:
-#: the URL is written to the generated patch and to the run's own records.
-_CREDENTIAL_QUERY_KEYS = {
-    "api_key",
-    "apikey",
-    "api-key",
-    "key",
-    "token",
-    "access_token",
-    "auth",
-    "authorization",
-    "password",
-    "passwd",
-    "secret",
-    "client_secret",
-}
+#: Query keys that carry a credential are recognised by the shared
+#: :func:`_credential_key` predicate: the endpoint's key belongs in
+#: ``--agent-model-api-key`` / the key environment variable, not in the URL,
+#: because the URL is written to the generated patch and the run's own records.
 
 
 def endpoint_credentials(url: str) -> str:
@@ -1286,10 +1446,7 @@ def endpoint_credentials(url: str) -> str:
     except ValueError:
         return ""
     for key, _value in pairs:
-        lowered = str(key).strip().lower()
-        if lowered in _CREDENTIAL_QUERY_KEYS or lowered.endswith(
-                ("_key", "_token", "_secret", "_password")
-        ):
+        if _credential_key(key):
             return "query parameter %r" % key
     return ""
 
@@ -1472,6 +1629,9 @@ def parse_prep_json(value: Any) -> Dict[str, Any]:
     return parsed
 
 
+_PREP_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
 class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
     """Forward DSH's OpenAI-compatible requests, merging the prep object."""
 
@@ -1505,8 +1665,28 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
             self._target(), data=body, headers=headers, method=method
         )
         try:
-            response = urllib.request.urlopen(request, timeout=600.0)
+            response = _PREP_OPENER.open(request, timeout=600.0)
         except urllib.error.HTTPError as exc:
+            if 300 <= exc.code < 400:
+                # urllib's default redirect handler would resend the request,
+                # including the Authorization header, to the Location host and
+                # a 302 would even turn the POST into a GET.  Refuse instead.
+                raw = json.dumps(
+                    {
+                        "error": {
+                            "message": "custom endpoint proxy refused a redirect "
+                            "(HTTP %d); credentials are not forwarded to another "
+                            "host" % exc.code
+                        }
+                    }
+                ).encode()
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                with contextlib.suppress(OSError):
+                    self.wfile.write(raw)
+                return
             raw = exc.read()
             self.send_response(exc.code)
             ctype = exc.headers.get("Content-Type") if exc.headers else None
@@ -1536,7 +1716,6 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
                 "transfer-encoding",
                 "connection",
                 "content-length",
-                "content-encoding",
             ):
                 continue
             self.send_header(key, value)
@@ -1560,7 +1739,30 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self._forward("GET")
 
+    def _chunked(self) -> bool:
+        transfer = str(self.headers.get("Transfer-Encoding") or "").lower()
+        return "chunked" in transfer
+
     def do_POST(self) -> None:
+        if self._chunked():
+            # Reading only Content-Length silently forwarded a chunked POST
+            # without its body.  Reject the unsupported framing (the retry
+            # proxy does the same) instead of corrupting a valid request.
+            raw = json.dumps(
+                {
+                    "error": {
+                        "message": "chunked request bodies are not supported by "
+                        "the custom endpoint proxy"
+                    }
+                }
+            ).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            with contextlib.suppress(OSError):
+                self.wfile.write(raw)
+            return
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except (TypeError, ValueError):
@@ -1630,7 +1832,12 @@ def stop_prep_proxy(server: Any = None) -> None:
     """
     with _PROXY_LOCK:
         if isinstance(server, str):
-            server = _PROXY_BY_BASE.pop(server, None)
+            known = _PROXY_BY_BASE.pop(server, None)
+            if known is None:
+                # An unknown base URL is not "all proxies": the docstring's
+                # no-op counterexample.  Only an explicit None means stop all.
+                return
+            server = known
         targets = [server] if server is not None else list(_ACTIVE_PROXIES)
         for item in targets:
             _ACTIVE_PROXIES.discard(item)
@@ -1726,6 +1933,18 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _env_base_url(name: str, default: str) -> Tuple[str, str]:
+    """(credential-free base URL, extracted secret) for an environment URL.
+
+    The generated patch/argv/environment are persisted artifacts, so a
+    ``PAPER_*_BASE_URL`` that carries userinfo or a credential query parameter
+    must not reach them verbatim.  The secret is returned separately and folded
+    into the provider key instead.
+    """
+    base, secret = split_endpoint_credentials(_env(name, default))
+    return base.rstrip("/"), secret
+
+
 def _normalized_family(selection: AgentSelection) -> str:
     if selection.is_endpoint:
         return "endpoint"
@@ -1764,11 +1983,18 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
             "effort": None,
         }
     if family == "qwen":
+        base_url, base_secret = _env_base_url(
+            "PAPER_QWEN_BASE_URL", QWEN_DEFAULT_BASE_URL
+        )
+        key_env = str(
+            model_fact("qwen38-27b", "api_key_env") or "PAPER_QWEN_API_KEY"
+        )
         return {
             "family": family,
-            "base_url": _env("PAPER_QWEN_BASE_URL", QWEN_DEFAULT_BASE_URL).rstrip("/"),
-            "api_key": _env("PAPER_QWEN_API_KEY", QWEN_DEFAULT_API_KEY),
-            "api_key_env": "PAPER_QWEN_API_KEY",
+            "provider": model_fact("qwen38-27b", "dsh_provider") or "qwen",
+            "base_url": base_url,
+            "api_key": _env(key_env) or base_secret or QWEN_DEFAULT_API_KEY,
+            "api_key_env": key_env,
             "model": _env("PAPER_QWEN_MODEL", QWEN_DEFAULT_MODEL),
             "context_window": _int_env(
                 "PAPER_QWEN_CONTEXT_WINDOW", QWEN_CONTEXT_WINDOW
@@ -1780,15 +2006,25 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
         }
     if family == "dots":
         compaction = dots_compaction(LLM_POLICY)
-        regular_env = compaction.get("regular_api_key_env", "DOTS_API_KEY")
+        regular_env = str(
+            model_fact("dots3-note-preview", "api_key_env")
+            or compaction.get("regular_api_key_env")
+            or "DOTS_API_KEY"
+        )
         compaction_key = _env(compaction["compaction_api_key_env"])
         for alias in compaction.get("compaction_api_key_aliases") or ():
             if not compaction_key:
                 compaction_key = _env(str(alias))
+        base_url, base_secret = _env_base_url(
+            "PAPER_DOTS_BASE_URL", DOTS_DEFAULT_BASE_URL
+        )
         return {
             "family": family,
-            "base_url": _env("PAPER_DOTS_BASE_URL", DOTS_DEFAULT_BASE_URL).rstrip("/"),
-            "api_key": _env("PAPER_DOTS_API_KEY") or _env(regular_env),
+            "provider": model_fact("dots3-note-preview", "dsh_provider") or "dots",
+            "base_url": base_url,
+            "api_key": (
+                _env("PAPER_DOTS_API_KEY") or _env(regular_env) or base_secret
+            ),
             "api_key_env": regular_env,
             "compaction_api_key": compaction_key,
             "compaction_api_key_env": compaction["compaction_api_key_env"],
@@ -1805,6 +2041,7 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
         info = selection.model_info()
         return {
             "family": family,
+            "provider": info.get("dsh_provider") or "deepseek-official",
             "base_url": "",
             "api_key": _env("DEEPSEEK_API_KEY") or _env("PAPER_DEEPSEEK_API_KEY"),
             "api_key_env": "DEEPSEEK_API_KEY",
@@ -1871,7 +2108,9 @@ def selection_env(selection: Optional[AgentSelection]) -> Dict[str, str]:
         if settings["api_key"]:
             env.setdefault("DEEPSEEK_API_KEY", str(settings["api_key"]))
     elif family == "qwen":
-        env["PAPER_QWEN_API_KEY"] = str(settings["api_key"] or QWEN_DEFAULT_API_KEY)
+        env[str(settings["api_key_env"])] = str(
+            settings["api_key"] or QWEN_DEFAULT_API_KEY
+        )
     elif family == "dots":
         if settings["api_key"]:
             env[str(settings["api_key_env"])] = str(settings["api_key"])
@@ -1902,10 +2141,12 @@ def selection_problem(
     """
     if selection is None or selection.model is None:
         return ""
+    if dry_run:
+        # Do not evaluate the request-side settings at all: an invalid operator
+        # override must not turn the documented dry-run no-op into an exception.
+        return ""
     settings = _provider_family_settings(selection)
     family = settings["family"]
-    if dry_run:
-        return ""
     if family == "deepseek" and selection.harness in (
         AGENT_HARNESS_GPT_CODEX,
         AGENT_HARNESS_CLAUDE_CODE,
@@ -2015,15 +2256,16 @@ def dsh_patch_text(
         )
     if family == "qwen":
         model = raw_model or settings["model"]
+        provider = settings.get("provider") or "qwen"
         return (
             (
                 "# Generated by generic_debug_pipeline for this stage: --agent-model qwen38-27b.\n"
             "- id: llm-pi-ai\n"
             "  config:\n"
             "    providers:\n"
-            "      qwen:\n"
+            "      %s:\n"
             "        displayName: %s\n"
-            "        apiKeyEnv: PAPER_QWEN_API_KEY\n"
+            "        apiKeyEnv: %s\n"
             "        api: openai-completions\n"
             "        baseURL: %s\n"
             "        models:\n"
@@ -2040,12 +2282,14 @@ def dsh_patch_text(
             + retry_policy_yaml(LLM_POLICY, "        ")
             + "- id: agent-default-model\n"
             "  config:\n"
-            "    provider: qwen\n"
+            "    provider: %s\n"
             "    model: %s\n"
             "    reasoningEffort: %s\n"
             )
             % (
+                provider,
                 json.dumps("Qwen vLLM (%s)" % model),
+                settings["api_key_env"],
                 json.dumps(base_url_override or settings["base_url"]),
                 json.dumps(model),
                 int(
@@ -2054,6 +2298,7 @@ def dsh_patch_text(
                     or QWEN_CONTEXT_WINDOW
                 ),
                 int(max_tokens_override or settings["max_tokens"] or QWEN_MAX_TOKENS),
+                provider,
                 json.dumps(model),
                 json.dumps(
                     normalize_reasoning_effort(
@@ -2070,6 +2315,7 @@ def dsh_patch_text(
         return dots_dsh_overlay(
             LLM_POLICY,
             model=model,
+            provider=settings.get("provider") or "dots",
             base_url=base_url_override or settings["base_url"],
             context_window=int(
                 context_window_override
@@ -2079,6 +2325,7 @@ def dsh_patch_text(
             max_tokens=int(
                 max_tokens_override or settings["max_tokens"] or DOTS_MAX_TOKENS
             ),
+            regular_api_key_env=settings["api_key_env"],
             compaction_base_url=compaction_base_url,
             reasoning_effort=str(
                 effort_override or settings["effort"] or DOTS_DEFAULT_EFFORT
@@ -2102,7 +2349,11 @@ def dsh_patch_text(
             "    model: %s\n"
             "    reasoningEffort: %s\n"
             % (
-                json.dumps(provider_override or "deepseek-official"),
+                json.dumps(
+                    provider_override
+                    or settings.get("provider")
+                    or "deepseek-official"
+                ),
                 json.dumps(model),
                 json.dumps(effort),
             )
@@ -2179,7 +2430,7 @@ def codex_provider_args(
                 "model_providers.deepseek.base_url", "https://api.deepseek.com"
             ),
             _codex_config(
-                "model_providers.deepseek.env_key", "DEEPSEEK_API_KEY"
+                "model_providers.deepseek.env_key", settings["api_key_env"]
             ),
             _codex_config("model_providers.deepseek.wire_api", "responses"),
             _codex_config("web_search", "disabled"),
@@ -2203,7 +2454,9 @@ def codex_provider_args(
             _codex_config(
                 "model_providers.qwen.base_url", settings["base_url"]
             ),
-            _codex_config("model_providers.qwen.env_key", "PAPER_QWEN_API_KEY"),
+            _codex_config(
+                "model_providers.qwen.env_key", settings["api_key_env"]
+            ),
             _codex_config("model_providers.qwen.wire_api", "responses"),
             _codex_config("web_search", "disabled"),
             _codex_config(
@@ -2223,7 +2476,7 @@ def codex_provider_args(
             _codex_config(
                 "model_providers.dots.base_url", settings["base_url"]
             ),
-            _codex_config("model_providers.dots.env_key", "DOTS_API_KEY"),
+            _codex_config("model_providers.dots.env_key", settings["api_key_env"]),
             _codex_config("model_providers.dots.wire_api", "responses"),
             _codex_config("web_search", "disabled"),
             _codex_config(
@@ -2346,50 +2599,6 @@ def claude_environment(
     return env
 
 
-_PREP_SECRET_KEYS = frozenset(
-    {
-        "key",
-        "api_key",
-        "api-key",
-        "apikey",
-        "access_key",
-        "access-token",
-        "access_token",
-        "token",
-        "auth_token",
-        "auth-token",
-        "api_token",
-        "api-token",
-        "secret",
-        "secret_key",
-        "secret-key",
-        "private_key",
-        "private-key",
-        "client_secret",
-        "client-secret",
-        "credential",
-        "credentials",
-        "password",
-        "authorization",
-    }
-)
-_PREP_SECRET_SUFFIXES = (
-    "_api_key",
-    "-api-key",
-    "_access_key",
-    "_access_token",
-    "_auth_token",
-    "_api_token",
-    "_secret_key",
-    "-secret-key",
-    "_private_key",
-    "-private-key",
-    "_client_secret",
-    "_password",
-    "_secret",
-)
-
-
 def effective_agent_model(cmd: Sequence[Any]) -> Dict[str, Any]:
     """A best-effort, secret-free label for the model a command will use.
 
@@ -2417,20 +2626,38 @@ def effective_agent_model(cmd: Sequence[Any]) -> Dict[str, Any]:
         return argv[index + 1] if index + 1 < len(argv) else default
 
     if "--endpoint" in argv:
+        model_name = _arg("--model-name") or "default"
         return {
-            "name": _arg("--model-name") or "default",
-            "endpoint": _arg("--endpoint"),
+            "name": redact_endpoint_url(model_name),
+            "endpoint": redact_endpoint_url(_arg("--endpoint")),
             "harness": _arg("--harness", "dsh"),
+            # The record is secret-free: report only whether a key reached the
+            # command, never its value.
+            "api_key_set": bool(
+                _arg("--api-key")
+                or _arg("--agent-model-api-key")
+                or _env(AGENT_MODEL_API_KEY_ENV)
+            ),
             "source": "--agent-model(custom endpoint)/--agent-model-api-key",
         }
     if "--harness" in argv and "--model" in argv:
         model = _arg("--model")
+        # A raw endpoint URL may carry userinfo/query credentials; the record
+        # must keep only the scheme/host/path, exactly like to_record().
+        record_model = (
+            redact_endpoint_url(model) if agent_model_is_endpoint(model) else model
+        )
         canonical = normalize_agent_model(model)
         info = AGENT_MODELS.get(canonical) or {}
         return {
-            "name": model,
-            "id": info.get("id") or model,
+            "name": record_model,
+            "id": info.get("id") or record_model,
             "harness": _arg("--harness"),
+            "api_key_set": bool(
+                _arg("--api-key")
+                or _arg("--agent-model-api-key")
+                or _env(AGENT_MODEL_API_KEY_ENV)
+            ),
             "source": "--agent-model/--agent-harness",
         }
     if "codex" in exe:
@@ -2475,9 +2702,7 @@ def redact_prep_object(value: Any) -> Any:
     if isinstance(value, dict):
         result = {}
         for key, item in value.items():
-            text = str(key).lower()
-            is_secret = text in _PREP_SECRET_KEYS or text.endswith(_PREP_SECRET_SUFFIXES)
-            if is_secret:
+            if _credential_key(key):
                 # A secret-named key masks its whole value, whatever its type: a
                 # list/dict under `api_key` used to lose the key context when the
                 # recursion descended into it and returned the credential unchanged.

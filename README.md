@@ -137,13 +137,16 @@ bug; report it so it can be moved here.
 ```bash
 python3 repos/agent-common/check_model_catalog.py
 python3 repos/agent-common/check_llm_policy.py
+python3 repos/agent-common/check_shared_package.py
 python3 repos/agent-common/check_cross_repo_consistency.py
 python3 -m unittest discover -s repos/agent-common -p 'test_*.py'
 ```
 
-The three checks read the `agent-common/agent_common/` package inside each
-sibling checkout's submodule, so they fail if a checkout is not initialized or
-if its submodule was modified locally.
+The checks read the `agent-common/agent_common/` package inside each sibling
+checkout's submodule.  `check_shared_package.py` hashes every file in that
+package (excluding `__pycache__`), so the checks fail if a checkout is not
+initialized or if any shared module — not only the catalog and the retry
+policy — was modified locally.
 
 ## Shared logic modules
 

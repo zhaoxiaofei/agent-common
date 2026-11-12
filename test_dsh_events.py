@@ -68,6 +68,15 @@ class TurnEndErrorTests(unittest.TestCase):
         self.assertEqual(turn_end_error({"kind": "completed"}), "")
         self.assertEqual(turn_end_error(None), "")
 
+    def test_every_failure_kind_produces_a_diagnostic(self):
+        # ``failed`` is in FAILURE_KINDS, so turn_end_error must agree with
+        # turn_end_failed about the same event.
+        self.assertEqual(turn_end_error({"kind": "failed", "message": "why"}), "why")
+        self.assertEqual(
+            turn_end_error({"kind": "Failed"}),
+            "turn ended with an error",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -51,8 +51,6 @@ DEFAULT_POLICY: Dict[str, Any] = {
         ],
     },
     "dots": {
-        "base_url": "https://note3-prev-api.askdiandian.com/v1",
-        "model": "dots3-note-prev",
         "regular_api_key_env": "DOTS_API_KEY",
         "compaction_api_key_env": "DOTS_API_KEY_1474",
         "compaction_api_key_aliases": [
@@ -125,6 +123,28 @@ def _merge_policy(document: Mapping[str, Any]) -> Dict[str, Any]:
         raise ValueError("retry.max_retries must be non-negative")
     if not 0.0 <= retry["jitter_ratio"] <= 1.0:
         raise ValueError("retry.jitter_ratio must be between 0 and 1")
+    # The dots section is merged straight into the policy and later consumed by
+    # os.environ.get(...)/YAML generation.  A list/null key-env or provider used
+    # to load "successfully" and crash on the first request.
+    dots = policy["dots"]
+    for key in (
+        "regular_api_key_env",
+        "compaction_api_key_env",
+        "compaction_provider",
+        "compaction_provider_label",
+    ):
+        if key in dots and dots[key] is not None:
+            if not isinstance(dots[key], str) or not dots[key].strip():
+                raise ValueError("dots.%s must be a non-empty string" % key)
+    aliases = dots.get("compaction_api_key_aliases")
+    if aliases is not None:
+        if not isinstance(aliases, (list, tuple)) or not all(
+            isinstance(alias, str) and alias.strip() for alias in aliases
+        ):
+            raise ValueError(
+                "dots.compaction_api_key_aliases must be a list of non-empty strings"
+            )
+        dots["compaction_api_key_aliases"] = [str(alias) for alias in aliases]
     # The compaction tuning fields are consumed by int(...) in the generated
     # DSH patch; a typo used to load "successfully" and then crash patch
     # generation, defeating load_policy's documented fallback.
@@ -177,7 +197,7 @@ def load_policy(path: Optional[Any] = None) -> Dict[str, Any]:
         return _copy(DEFAULT_POLICY)
     try:
         return _merge_policy(document)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return _copy(DEFAULT_POLICY)
 
 
@@ -423,10 +443,12 @@ class _RetryProxyHandler(http.server.BaseHTTPRequestHandler):
                 last_headers = headers
                 try:
                     last_body = response.read()
-                except http.client.HTTPException as exc:
-                    # A truncated 5xx error body is exactly the failure class the
-                    # proxy exists for: retry it instead of letting the exception
-                    # kill the handler thread and close the client connection.
+                except (OSError, http.client.HTTPException) as exc:
+                    # A truncated or stalled 5xx error body is exactly the
+                    # failure class the proxy exists for: retry it instead of
+                    # letting the exception kill the handler thread and close
+                    # the client connection.  ``socket.timeout``/``TimeoutError``
+                    # are ``OSError`` subclasses, not ``HTTPException``.
                     proxy.log(
                         "%s: upstream %s body read failed after HTTP %d: %s"
                         % (proxy.name, method, status, exc)
@@ -568,7 +590,13 @@ class RetryProxy:
             logging failed.
         """
         if self._log is not None:
-            self._log(message)
+            try:
+                self._log(message)
+            except Exception:
+                # The documented contract is that logging never fails the
+                # request.  A callback writing to a closed stream (or any other
+                # bug) must not abort the retry loop and close the client.
+                pass
 
     def target_path(self, path: str) -> str:
         """Forward ``path`` under the upstream's own base path.
@@ -696,7 +724,8 @@ def default_log(message: str) -> None:
     try:
         sys.stderr.write(message + "\n")
         sys.stderr.flush()
-    except OSError:
+    except (OSError, ValueError):
+        # A closed/replaced stderr raises ValueError as well as OSError.
         pass
 
 
@@ -814,8 +843,10 @@ def dots_dsh_overlay(
     *,
     model: str,
     base_url: str,
+    provider: str = "dots",
     context_window: int,
     max_tokens: int,
+    regular_api_key_env: Optional[str] = None,
     compaction_base_url: Optional[str] = None,
     stream_idle_timeout_ms: Optional[int] = None,
     reasoning_effort: str = "high",
@@ -834,7 +865,10 @@ def dots_dsh_overlay(
     none, the shared catalog's default for this model).  ``none``/``off``
     disables effort selection entirely, which is the API's lower state, and an
     unrecognised non-``off`` spelling is treated as the default (every
-    thinking level reaches the same wire value).
+    thinking level reaches the same wire value).  ``provider`` is the
+    catalog-owned DSH provider name for the regular route (default ``dots``);
+    ``regular_api_key_env`` is the catalog-owned key variable for the regular
+    Dots provider; the policy's ``regular_api_key_env`` remains the fallback.
 
     Example:
         ``dots_dsh_overlay(policy, model="dots3-note-prev", base_url=..., ...)``
@@ -871,9 +905,13 @@ def dots_dsh_overlay(
         "- id: llm-pi-ai",
         "  config:",
         "    providers:",
-        "      dots:",
+        "      %s:" % provider,
         "        displayName: %s" % json.dumps("Dots API (%s)" % model),
-        "        apiKeyEnv: %s" % dots.get("regular_api_key_env", "DOTS_API_KEY"),
+        "        apiKeyEnv: %s"
+        % (
+            regular_api_key_env
+            or dots.get("regular_api_key_env", "DOTS_API_KEY")
+        ),
         "        api: openai-completions",
         "        baseURL: %s" % json.dumps(base_url),
         "        models:",
@@ -921,7 +959,7 @@ def dots_dsh_overlay(
     lines += [
         "- id: agent-default-model",
         "  config:",
-        "    provider: dots",
+        "    provider: %s" % provider,
         "    model: %s" % json.dumps(model),
     ]
     if thinking:

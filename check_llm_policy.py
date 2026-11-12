@@ -90,6 +90,11 @@ def main() -> int:
                  "paper_model_agent.py"):
         adapter = ROOT / "paper-refine" / name
         if not adapter.is_file():
+            # An initialized paper-refine checkout must carry the adapter; a
+            # missing file used to be silently skipped, so the final OK claimed
+            # the shared-runtime wiring had been inspected when it had not.
+            if (ROOT / "paper-refine").is_dir():
+                problems.append("missing adapter: %s" % adapter)
             continue
         text = adapter.read_text(encoding="utf-8")
         if "import model_runtime as rt" not in text:

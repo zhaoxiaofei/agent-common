@@ -6,8 +6,10 @@ import importlib
 import inspect
 import pkgutil
 import unittest
+from pathlib import Path
 
 import agent_common
+from agent_common import model_runtime
 
 # Discover every module in the package so a newly exported helper cannot evade
 # the documentation contract.
@@ -56,6 +58,19 @@ class PublicApiDocumentationTests(unittest.TestCase):
                 ):
                     missing.append(f"{module.__name__}.{name}")
         self.assertEqual(missing, [], "undocumented public classes: %r" % missing)
+
+    def test_api_md_typical_flow_records_the_selection_with_to_record(self):
+        # ``effective_agent_model`` takes an argv sequence, not an
+        # AgentSelection; the documented flow must not raise TypeError.
+        text = (Path(__file__).with_name("API.md")).read_text(encoding="utf-8")
+        self.assertNotIn("effective_agent_model(selection)", text)
+        self.assertIn("selection.to_record()", text)
+        selection = model_runtime.resolve_agent_selection(
+            harness="dsh", model="dots3-note-preview"
+        )
+        self.assertIn("llm-pi-ai", model_runtime.dsh_patch_text(selection))
+        self.assertIsInstance(model_runtime.selection_env(selection), dict)
+        self.assertEqual(selection.to_record()["model"], "dots3-note-preview")
 
 
 if __name__ == "__main__":

@@ -119,12 +119,13 @@ def turn_end_error(reason: Any) -> str:
         ``turn_end_error({"kind":"error","error":{"message":"boom"}}) == "boom"``.
 
     Counterexample:
-        A non-error reason such as ``{"kind":"completed"}`` returns ``""``; the
+        A non-failure reason such as ``{"kind":"completed"}`` returns ``""``; the
         caller adds its own fallback text.
     """
     if not isinstance(reason, Mapping):
         return ""
-    if reason.get("kind") != "error" and not reason.get("error"):
+    kind = str(reason.get("kind") or "").strip().lower()
+    if kind not in FAILURE_KINDS and not reason.get("error"):
         return ""
     error = reason.get("error")
     if isinstance(error, Mapping):

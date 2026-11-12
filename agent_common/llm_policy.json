@@ -29,8 +29,6 @@
     ]
   },
   "dots": {
-    "base_url": "https://note3-prev-api.askdiandian.com/v1",
-    "model": "dots3-note-prev",
     "regular_api_key_env": "DOTS_API_KEY",
     "compaction_api_key_env": "DOTS_API_KEY_1474",
     "compaction_api_key_aliases": [
