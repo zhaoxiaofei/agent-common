@@ -134,6 +134,63 @@ class LlmPolicyCheckTests(unittest.TestCase):
         self.assertIn("missing adapter", output.getvalue())
 
 
+class LlmPolicyRuntimeValidationTests(unittest.TestCase):
+    def _checkout(self, mutate_policy=None, module_text=None):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        canonical = root / "agent_common"
+        canonical.mkdir()
+        shutil.copy(check_llm_policy.CANONICAL_JSON, canonical / "llm_policy.json")
+        if mutate_policy is not None:
+            document = json.loads(
+                (canonical / "llm_policy.json").read_text(encoding="utf-8")
+            )
+            mutate_policy(document)
+            (canonical / "llm_policy.json").write_text(
+                json.dumps(document), encoding="utf-8"
+            )
+        (canonical / "llm_retry.py").write_text(
+            module_text
+            if module_text is not None
+            else check_llm_policy.CANONICAL_MODULE.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        return root, canonical
+
+    def _run(self, root, canonical):
+        output = io.StringIO()
+        with mock.patch.object(check_llm_policy, "ROOT", root), mock.patch.object(
+            check_llm_policy, "CANONICAL_DIR", canonical
+        ), mock.patch.object(
+            check_llm_policy, "CANONICAL_JSON", canonical / "llm_policy.json"
+        ), mock.patch.object(
+            check_llm_policy, "CANONICAL_MODULE", canonical / "llm_retry.py"
+        ), mock.patch.object(
+            check_llm_policy, "COPIES", ()
+        ):
+            with contextlib.redirect_stdout(output):
+                code = check_llm_policy.main()
+        return code, output.getvalue()
+
+    def test_a_syntactically_invalid_module_fails_the_check(self):
+        root, canonical = self._checkout(
+            module_text="this is not valid python !!!\n"
+        )
+        code, output = self._run(root, canonical)
+        self.assertEqual(code, 1)
+        self.assertIn("not importable Python", output)
+
+    def test_a_policy_the_runtime_rejects_fails_the_check(self):
+        def mutate(document):
+            document["retry"]["jitter_ratio"] = -1
+
+        root, canonical = self._checkout(mutate_policy=mutate)
+        code, output = self._run(root, canonical)
+        self.assertEqual(code, 1)
+        self.assertIn("runtime rejects this policy", output)
+
+
 class SharedPackageCheckTests(unittest.TestCase):
     def _tree(self):
         directory = tempfile.TemporaryDirectory()

@@ -49,7 +49,43 @@ def main() -> int:
         print("missing canonical helper: %s" % CANONICAL_MODULE)
         return 1
 
+    # An equal sha256 only proves the copies agree.  Compile and execute the
+    # canonical module so a syntactically invalid or unimportable helper fails
+    # the check instead of being reported as OK.
+    try:
+        code = compile(
+            CANONICAL_MODULE.read_text(encoding="utf-8"),
+            str(CANONICAL_MODULE),
+            "exec",
+        )
+        exec(
+            code,
+            {"__name__": "_checked_llm_retry", "__file__": str(CANONICAL_MODULE)},
+        )
+    except Exception as exc:  # noqa: BLE001 - a checker reports, never crashes
+        problems.append(
+            "%s is not importable Python: %s: %s"
+            % (CANONICAL_MODULE, type(exc).__name__, exc)
+        )
+
     document = json.loads(CANONICAL_JSON.read_text(encoding="utf-8"))
+    # The checker must not accept a policy that load_policy would reject and
+    # silently replace with the defaults.  Import here, after the syntax check,
+    # so an invalid canonical module is reported instead of crashing the checker
+    # before it can print anything.
+    try:
+        from agent_common import llm_retry as _llm_retry
+    except Exception as exc:  # noqa: BLE001 - a checker reports, never crashes
+        problems.append(
+            "cannot import agent_common.llm_retry: %s: %s"
+            % (type(exc).__name__, exc)
+        )
+        _llm_retry = None
+    if _llm_retry is not None:
+        try:
+            _llm_retry._merge_policy(document)
+        except (TypeError, ValueError, OverflowError) as exc:
+            problems.append("the runtime rejects this policy: %s" % exc)
     retry = document.get("retry") or {}
     expected = [10, 20, 40, 80, 160, 320, 640, 1280, 2560, 3600]
     initial = float(retry.get("initial_delay_seconds", 0))

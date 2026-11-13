@@ -41,6 +41,32 @@ class TurnEndTests(unittest.TestCase):
         event["reason"] = {"kind": "error"}
         self.assertIs(turn_end_failed(event), True)
 
+    def test_success_requires_positive_evidence(self):
+        # A turn-end with no status/kind cannot be assumed successful, and a
+        # non-success kind wins over a stale status=ok.
+        self.assertIs(turn_end_failed({"type": "turn_end"}), True)
+        self.assertIs(
+            turn_end_failed({"type": "turn_end", "status": "ok", "kind": "cancelled"}),
+            True,
+        )
+        self.assertIs(
+            turn_end_failed(
+                {
+                    "type": "status",
+                    "phase": "turn_end",
+                    "status": "ok",
+                    "reason": {"kind": "cancelled"},
+                }
+            ),
+            True,
+        )
+        self.assertIs(
+            turn_end_failed(
+                {"type": "turn_end", "status": "ok", "kind": "completed"}
+            ),
+            False,
+        )
+
     def test_non_turn_end_events_are_none(self):
         self.assertIsNone(turn_end_failed({"type": "text"}))
         self.assertIsNone(line_turn_end_failed(b"not json"))

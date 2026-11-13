@@ -86,12 +86,17 @@ def turn_end_failed(event: Any) -> Optional[bool]:
     if isinstance(reason, Mapping):
         reason_kind = str(reason.get("kind") or "").lower()
     kind = str(event.get("kind") or reason_kind).lower()
-    if kind in FAILURE_KINDS:
+    # Any explicit non-success marker is a failure, even when the other field
+    # says ok: a cancelled turn that also carries a stale ``status: ok`` is not
+    # a completed turn.  Success therefore needs positive evidence in every
+    # field that is present, and a turn-end with no status/kind at all is not
+    # treated as success either (SUCCESS_STATUSES is an allowlist).
+    if kind and kind not in SUCCESS_STATUSES:
         return True
-    if status:
-        return status not in SUCCESS_STATUSES
-    if kind:
-        return kind not in SUCCESS_STATUSES
+    if status and status not in SUCCESS_STATUSES:
+        return True
+    if not status and not kind:
+        return True
     return False
 
 

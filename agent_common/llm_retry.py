@@ -29,6 +29,99 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
+#: Connection-scoped headers that must never be copied from the client to the
+#: upstream (or in a response).  ``Proxy-Authorization`` belongs to the loopback
+#: hop only; forwarding it would hand the proxy credential to the upstream.
+HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "connection",
+        "proxy-connection",
+        "proxy-authorization",
+        "keep-alive",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+
+#: Response headers the loopback server generates itself.  Copying the
+#: upstream's value as well is what produced duplicate Server/Date values.
+PROXY_RESPONSE_HEADERS = frozenset({"server", "date", "content-length"})
+
+
+def _request_is_chunked(headers: Mapping[str, str]) -> bool:
+    """Whether the client used unsupported chunked framing."""
+    transfer = str(headers.get("Transfer-Encoding") or "").lower()
+    return "chunked" in transfer
+
+
+def _declared_content_length(headers: Mapping[str, str]) -> Optional[int]:
+    """The request's Content-Length, ``None`` when absent.
+
+    Raises ``ValueError`` for an unparsable or negative value; treating it as
+    zero silently forwarded a corrupted request body.
+    """
+    raw = headers.get("Content-Length")
+    if raw in (None, ""):
+        return None
+    try:
+        length = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("invalid Content-Length header") from None
+    if length < 0:
+        raise ValueError("invalid Content-Length header")
+    return length
+
+
+def _read_request_body(
+    rfile: Any, headers: Mapping[str, str]
+) -> Optional[bytes]:
+    """Read the declared request body, or ``None`` for an empty one."""
+    length = _declared_content_length(headers)
+    return rfile.read(length) if length else None
+
+
+def _forwardable_request_headers(
+    headers: Mapping[str, str], *, extra_skip: Iterable[str] = ()
+) -> Dict[str, str]:
+    """Copy request headers, dropping the hop-by-hop and framing ones."""
+    skip = set(HOP_BY_HOP_HEADERS) | {"host", "content-length"}
+    skip.update(str(name).lower() for name in extra_skip)
+    return {
+        name: value
+        for name, value in headers.items()
+        if name.lower() not in skip
+    }
+
+
+def _forwardable_response_headers(
+    headers: Iterable[Tuple[str, str]]
+) -> List[Tuple[str, str]]:
+    """Upstream response headers safe to re-emit from the loopback server."""
+    return [
+        (name, value)
+        for name, value in headers
+        if name.lower() not in HOP_BY_HOP_HEADERS
+        and name.lower() not in PROXY_RESPONSE_HEADERS
+    ]
+
+
+def _relay_response_body(response: Any, write: Callable[[bytes], None]) -> None:
+    """Stream an upstream body to ``write`` until EOF, swallowing a broken pipe."""
+    read_chunk = getattr(response, "read1", response.read)
+    try:
+        while True:
+            chunk = read_chunk(65536)
+            if not chunk:
+                break
+            write(chunk)
+    except (OSError, ValueError, http.client.HTTPException):
+        # The response headers are already on the wire; close the truncated
+        # stream instead of letting the handler thread die.
+        return
+
+
 #: Fallback used when ``llm_policy.json`` is absent or malformed.  Keep this in
 #: sync with the canonical JSON; ``agent-common/check_llm_policy.py`` verifies it.
 DEFAULT_POLICY: Dict[str, Any] = {
@@ -236,19 +329,48 @@ class RetrySchedule:
     def __init__(self, policy: Optional[Mapping[str, Any]] = None):
         document = dict(policy or load_policy())
         retry = document.get("retry") or DEFAULT_POLICY["retry"]
+        if not isinstance(retry, Mapping):
+            raise ValueError("the retry policy must be a mapping")
+        raw = dict(retry)
+        # Validate through the same merge path as load_policy, but first fill
+        # the optional fields with this constructor's historical defaults
+        # (jitter off, empty retryable sets, Retry-After capped by max_delay)
+        # so validating a direct schedule does not silently change it.
+        base = {
+            "initial_delay_seconds": raw.get(
+                "initial_delay_seconds",
+                DEFAULT_POLICY["retry"]["initial_delay_seconds"],
+            ),
+            "multiplier": raw.get("multiplier", 2.0),
+            "max_delay_seconds": raw.get(
+                "max_delay_seconds", DEFAULT_POLICY["retry"]["max_delay_seconds"]
+            ),
+            "max_retries": raw.get(
+                "max_retries", DEFAULT_POLICY["retry"]["max_retries"]
+            ),
+            "jitter_ratio": raw.get("jitter_ratio", 0.0),
+            "retry_after_cap_seconds": raw.get(
+                "retry_after_cap_seconds",
+                raw.get(
+                    "max_delay_seconds",
+                    DEFAULT_POLICY["retry"]["max_delay_seconds"],
+                ),
+            ),
+            "retryable_http_statuses": raw.get("retryable_http_statuses") or [],
+            "retryable_error_codes": raw.get("retryable_error_codes") or [],
+        }
+        retry = _merge_policy({"retry": base})["retry"]
         self.initial_delay_seconds = float(retry["initial_delay_seconds"])
-        self.multiplier = float(retry.get("multiplier", 2.0))
+        self.multiplier = float(retry["multiplier"])
         self.max_delay_seconds = float(retry["max_delay_seconds"])
         self.max_retries = int(retry["max_retries"])
-        self.jitter_ratio = float(retry.get("jitter_ratio", 0.0))
-        self.retry_after_cap_seconds = float(
-            retry.get("retry_after_cap_seconds", self.max_delay_seconds)
-        )
+        self.jitter_ratio = float(retry["jitter_ratio"])
+        self.retry_after_cap_seconds = float(retry["retry_after_cap_seconds"])
         self.retryable_statuses = frozenset(
-            int(status) for status in retry.get("retryable_http_statuses") or ()
+            int(status) for status in retry["retryable_http_statuses"]
         )
         self.retryable_codes = frozenset(
-            str(code) for code in retry.get("retryable_error_codes") or ()
+            str(code) for code in retry["retryable_error_codes"]
         )
 
     def delay(
@@ -264,7 +386,10 @@ class RetrySchedule:
         ``Retry-After`` header); it wins up to the same 3600-second cap.
 
         Example:
-            With the default policy, ``delay(1) == 10`` and ``delay(3) == 40``.
+            With the default policy, ``delay(1, jitter=False) == 10`` and
+            ``delay(3, jitter=False) == 40``.  Jitter is on by default, so a plain
+            ``delay(1)`` returns a random value within the policy's
+            ``jitter_ratio`` of that schedule.
 
         Counterexample:
             ``delay(0)`` and ``delay(-1)`` both behave like the first retry; retry
@@ -282,7 +407,13 @@ class RetrySchedule:
                 # sleep either (time.sleep raises ValueError).
                 return max(0.0, min(requested, self.retry_after_cap_seconds))
         exponent = max(0, int(retry_number) - 1)
-        delay = self.initial_delay_seconds * (self.multiplier ** exponent)
+        try:
+            delay = self.initial_delay_seconds * (self.multiplier ** exponent)
+        except OverflowError:
+            # A long-running caller can reach an exponent whose float
+            # exponentiation overflows; the documented cap is the answer, not
+            # an exception.
+            delay = math.inf
         delay = min(delay, self.max_delay_seconds)
         if jitter and self.jitter_ratio:
             factor = 1.0 - self.jitter_ratio + 2.0 * self.jitter_ratio * random.random()
@@ -377,15 +508,10 @@ class _RetryProxyHandler(http.server.BaseHTTPRequestHandler):
         self._handle("POST")
 
     def _chunked(self) -> bool:
-        transfer = str(self.headers.get("Transfer-Encoding") or "").lower()
-        return "chunked" in transfer
+        return _request_is_chunked(self.headers)
 
     def _body(self) -> Optional[bytes]:
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except (TypeError, ValueError):
-            length = 0
-        return self.rfile.read(length) if length > 0 else None
+        return _read_request_body(self.rfile, self.headers)
 
     def _handle(self, method: str) -> None:
         proxy: "RetryProxy" = self.server.proxy  # type: ignore[attr-defined]
@@ -396,7 +522,13 @@ class _RetryProxyHandler(http.server.BaseHTTPRequestHandler):
                 400, "chunked request bodies are not supported by the retry proxy"
             )
             return
-        body = self._body()
+        try:
+            body = self._body()
+        except ValueError as exc:
+            # An unparsable Content-Length used to become a zero-length body,
+            # silently forwarding a corrupted request downstream.
+            self._send_error(400, str(exc))
+            return
         schedule = proxy.schedule
         attempt = 0
         last_status = 0
@@ -437,7 +569,13 @@ class _RetryProxyHandler(http.server.BaseHTTPRequestHandler):
                 continue
             try:
                 if status < 400 or not schedule.status_is_retryable(status):
-                    self._relay(status, headers, response)
+                    try:
+                        self._relay(status, headers, response)
+                    finally:
+                        # The upstream connection is per-attempt; close it on
+                        # the success path just like the retry path does.
+                        response.close()
+                        connection.close()
                     return
                 last_status = status
                 last_headers = headers
@@ -509,25 +647,14 @@ class _RetryProxyHandler(http.server.BaseHTTPRequestHandler):
         self._copy_headers(headers)
         self.send_header("Connection", "close")
         self.end_headers()
-        try:
-            while True:
-                chunk = response.read(65536)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-        except (OSError, ValueError, http.client.HTTPException):
-            pass
+        _relay_response_body(
+            response, lambda chunk: (self.wfile.write(chunk), self.wfile.flush())
+        )
 
     def _copy_headers(self, headers: Iterable[Tuple[str, str]]) -> None:
-        for name, value in headers:
-            if name.lower() in (
-                "transfer-encoding",
-                "connection",
-                "content-length",
-                "keep-alive",
-            ):
-                continue
+        # send_response() already wrote Server/Date/Content-Length; copying
+        # them again produced duplicates.
+        for name, value in _forwardable_response_headers(headers):
             self.send_header(name, value)
 
 
@@ -563,14 +690,32 @@ class RetryProxy:
         log: Optional[Callable[[str], None]] = None,
         timeout: float = 600.0,
     ):
-        self.upstream_base = str(upstream_base).rstrip("/")
-        parsed = urllib.parse.urlsplit(self.upstream_base)
+        raw_base = str(upstream_base)
+        parsed = urllib.parse.urlsplit(raw_base)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise ValueError("upstream_base must be an http(s) URL: %r" % upstream_base)
+        if parsed.username is not None or parsed.password is not None:
+            # The proxy never authenticates the upstream hop with URL userinfo;
+            # accepting it and dropping it silently lost a caller's credential.
+            raise ValueError(
+                "upstream_base must not carry userinfo; pass the credential in "
+                "the forwarded Authorization header instead"
+            )
+        if parsed.fragment:
+            raise ValueError("upstream_base must not carry a URL fragment")
         self._scheme = parsed.scheme
         self._host = parsed.hostname
         self._port = parsed.port
         self._prefix = parsed.path.rstrip("/")
+        # A base URL may carry upstream parameters (for example
+        # ``?api-version=2024``); every forwarded request keeps them.
+        self._query = parsed.query
+        # Strip trailing slashes from the path only: a whole-string
+        # ``rstrip("/")`` would truncate a legitimate query value ending in a
+        # slash (``?path=/``).
+        self.upstream_base = urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, self._prefix, self._query, "")
+        )
         self.schedule = schedule or RetrySchedule()
         self.name = name
         self._log = log
@@ -607,14 +752,22 @@ class RetryProxy:
 
         Counterexample:
             A path already under the prefix is not prefixed twice; ``/v1/chat`` stays
-            ``/v1/chat``.
+            ``/v1/chat`` and ``/v1?x=1`` stays ``/v1?x=1``.
         """
         requested = path or "/"
+        # Compare only the path component: ``/v1?x=1`` is already under a
+        # ``/v1`` prefix even though it does not start with ``/v1/``.
+        path_only = requested.split("?", 1)[0]
         if self._prefix and (
-            requested == self._prefix or requested.startswith(self._prefix + "/")
+            path_only == self._prefix
+            or path_only.startswith(self._prefix + "/")
         ):
-            return requested
-        return self._prefix + requested
+            target = requested
+        else:
+            target = self._prefix + requested
+        if self._query:
+            target += ("&" if "?" in target else "?") + self._query
+        return target
 
     def open(
         self,
@@ -634,17 +787,7 @@ class RetryProxy:
             ``finally``); abandoning them leaks sockets.
         """
         target = self.target_path(path)
-        forward: Dict[str, str] = {}
-        for name, value in headers.items():
-            if name.lower() in (
-                "host",
-                "content-length",
-                "connection",
-                "transfer-encoding",
-                "keep-alive",
-            ):
-                continue
-            forward[name] = value
+        forward = _forwardable_request_headers(headers)
         if body is not None:
             forward["Content-Length"] = str(len(body))
         if self._scheme == "https":
@@ -655,8 +798,14 @@ class RetryProxy:
             connection = http.client.HTTPConnection(
                 self._host, self._port, timeout=self.timeout
             )
-        connection.request(method, target, body=body, headers=forward)
-        response = connection.getresponse()
+        try:
+            connection.request(method, target, body=body, headers=forward)
+            response = connection.getresponse()
+        except BaseException:
+            # The caller never receives the connection when this raises, so
+            # open() is the only place that can close it.
+            connection.close()
+            raise
         return response.status, response.getheaders(), response, connection
 
     def start(self) -> str:
@@ -970,8 +1119,84 @@ def dots_dsh_overlay(
     return "\n".join(lines) + "\n"
 
 
-_PROXY_REGISTRY: set = set()
-_PROXY_LOCK = threading.Lock()
+class _ProxyRegistry:
+    """Process-wide proxy ownership: one stop rule for every proxy kind.
+
+    Every started proxy is tagged with its owner kind (``retry``,
+    ``compaction``, ``prep``) and, when it has one, its loopback base URL.  A
+    scoped stop call selects by kind or base; a global stop call selects
+    everything of the retry family (``exclude={"prep"}``), so a compaction
+    wrapper can never stop an unrelated proxy.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._items: Dict[Any, Tuple[str, str]] = {}
+        self.by_base: Dict[str, Any] = {}
+
+    def add(self, item: Any, *, kind: str, base: str = "") -> None:
+        with self._lock:
+            self._items[item] = (str(kind), str(base or ""))
+            if base:
+                self.by_base[str(base)] = item
+
+    def remove(self, item: Any) -> None:
+        with self._lock:
+            self._items.pop(item, None)
+            for base, known in list(self.by_base.items()):
+                if known is item:
+                    self.by_base.pop(base, None)
+
+    def __contains__(self, item: Any) -> bool:
+        with self._lock:
+            return item in self._items
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+    def targets(
+        self,
+        *,
+        item: Any = None,
+        kind: Optional[str] = None,
+        base: Optional[str] = None,
+        exclude: Iterable[str] = (),
+    ) -> List[Any]:
+        excluded = {str(value) for value in exclude}
+        allowed = {str(kind)} if kind is not None else None
+        with self._lock:
+            if item is not None:
+                selected = [item]
+            elif base is not None:
+                known = self.by_base.get(str(base))
+                selected = [known] if known is not None else []
+            else:
+                selected = list(self._items)
+            targets = []
+            for candidate in selected:
+                info = self._items.get(candidate)
+                if info is None:
+                    # An explicit item may predate the registry (or be stopped
+                    # twice); stopping it is still harmless.
+                    if item is not None and not excluded:
+                        targets.append(candidate)
+                    continue
+                if allowed is not None and info[0] not in allowed:
+                    continue
+                if info[0] in excluded:
+                    continue
+                targets.append(candidate)
+            for candidate in targets:
+                self._items.pop(candidate, None)
+                for known_base, known in list(self.by_base.items()):
+                    if known is candidate:
+                        self.by_base.pop(known_base, None)
+            return targets
+
+
+#: Every proxy this process started, tagged with its owner kind.
+_PROXY_REGISTRY = _ProxyRegistry()
 
 
 def start_retry_proxy(
@@ -980,8 +1205,12 @@ def start_retry_proxy(
     *,
     name: str = "llm-retry-proxy",
     log: Optional[Callable[[str], None]] = None,
+    kind: str = "retry",
 ) -> Tuple[Optional[RetryProxy], str]:
     """Start one proxy and return ``(proxy, base_url)``; ``(None, "")`` on failure.
+
+    ``kind`` is the ownership tag a scoped stop call filters on (``retry`` by
+    default, ``compaction`` for the summarizer route).
 
     Example:
         ``proxy, base = start_retry_proxy("https://api.example/v1")`` returns a
@@ -998,25 +1227,35 @@ def start_retry_proxy(
         base = proxy.start()
     except (OSError, ValueError):
         return None, ""
-    with _PROXY_LOCK:
-        _PROXY_REGISTRY.add(proxy)
+    _PROXY_REGISTRY.add(proxy, kind=kind, base=base)
     return proxy, base
 
 
-def stop_retry_proxy(proxy: Optional[RetryProxy] = None) -> None:
-    """Stop one proxy, or every proxy this process started.
+def stop_retry_proxy(
+    proxy: Optional[RetryProxy] = None, *, kind: Optional[str] = None
+) -> None:
+    """Stop one proxy, every proxy of ``kind``, or every retry-family proxy.
 
     Example:
         ``stop_retry_proxy(proxy)`` stops one proxy; ``stop_retry_proxy()`` stops
-        every proxy this process started.
+        every retry and compaction proxy this process started (a prep proxy has
+        its own ``stop_prep_proxy``); ``stop_retry_proxy(kind="compaction")``
+        stops only the compaction-owned proxies.
 
     Counterexample:
-        Passing an already-stopped proxy is tolerated and does nothing.
+        Passing an already-stopped proxy is tolerated and does nothing.  An
+        explicit proxy wins over ``kind``; it is never broadened to the whole
+        registry.  A global ``stop_retry_proxy()`` deliberately leaves
+        ``kind="prep"`` proxies running.
     """
-    with _PROXY_LOCK:
-        targets = [proxy] if proxy is not None else list(_PROXY_REGISTRY)
-        for item in targets:
-            _PROXY_REGISTRY.discard(item)
+    if proxy is not None:
+        targets = _PROXY_REGISTRY.targets(item=proxy)
+    elif kind is not None:
+        targets = _PROXY_REGISTRY.targets(kind=kind)
+    else:
+        # The prep proxy has its own public stop function; a global retry stop
+        # must not tear it down.
+        targets = _PROXY_REGISTRY.targets(exclude=("prep",))
     for item in targets:
         if item is None:
             continue

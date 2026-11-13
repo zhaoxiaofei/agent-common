@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import tempfile
 import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -47,6 +49,219 @@ class ScheduleTests(unittest.TestCase):
         policy = load_policy("/nonexistent/llm_policy.json")
         self.assertEqual(policy["retry"]["max_delay_seconds"], 3600)
         self.assertEqual(policy["retry"]["max_retries"], 10)
+
+
+class ScheduleValidationTests(unittest.TestCase):
+    def test_the_documented_examples_are_the_jitter_free_schedule(self):
+        schedule = RetrySchedule(load_policy())
+        self.assertEqual(schedule.delay(1, jitter=False), 10)
+        self.assertEqual(schedule.delay(3, jitter=False), 40)
+        self.assertIn("jitter=False", RetrySchedule.delay.__doc__)
+
+    def test_a_directly_constructed_schedule_rejects_bad_delays(self):
+        for retry in (
+            {"initial_delay_seconds": -1, "max_delay_seconds": 2, "max_retries": 2},
+            {
+                "initial_delay_seconds": float("nan"),
+                "max_delay_seconds": 2,
+                "max_retries": 2,
+            },
+            {
+                "initial_delay_seconds": 1,
+                "max_delay_seconds": 2,
+                "max_retries": 2,
+                "jitter_ratio": -1,
+            },
+        ):
+            with self.subTest(retry=retry):
+                with self.assertRaises(ValueError):
+                    RetrySchedule({"retry": retry})
+
+    def test_validation_preserves_the_constructors_optional_defaults(self):
+        schedule = RetrySchedule(
+            {
+                "retry": {
+                    "initial_delay_seconds": 1,
+                    "max_delay_seconds": 2,
+                    "max_retries": 2,
+                }
+            }
+        )
+        self.assertEqual(schedule.jitter_ratio, 0.0)
+        self.assertEqual(schedule.retry_after_cap_seconds, 2)
+        self.assertEqual(schedule.retryable_statuses, frozenset())
+        self.assertEqual(schedule.retryable_codes, frozenset())
+
+    def test_a_large_retry_number_caps_instead_of_overflowing(self):
+        schedule = RetrySchedule(load_policy())
+        delay = schedule.delay(100000, jitter=False)
+        self.assertEqual(delay, schedule.max_delay_seconds)
+
+
+class ProxyTargetTests(unittest.TestCase):
+    def test_a_base_query_is_preserved_on_every_forwarded_path(self):
+        proxy = RetryProxy("https://host/v1?api-version=2024")
+        self.assertEqual(proxy.target_path("/chat"), "/v1/chat?api-version=2024")
+        self.assertEqual(
+            proxy.target_path("/v1/chat?x=1"), "/v1/chat?x=1&api-version=2024"
+        )
+
+    def test_an_already_prefixed_path_with_a_query_is_not_prefixed_twice(self):
+        proxy = RetryProxy("http://host/v1")
+        self.assertEqual(proxy.target_path("/v1?x=1"), "/v1?x=1")
+        self.assertEqual(proxy.target_path("/v1/chat?x=1"), "/v1/chat?x=1")
+
+    def test_a_query_value_ending_in_a_slash_is_preserved(self):
+        for base, expected in (
+            ("https://host/v1?path=/", "/v1/chat?path=/"),
+            ("https://host/v1?api-version=2024/", "/v1/chat?api-version=2024/"),
+        ):
+            with self.subTest(base=base):
+                proxy = RetryProxy(base)
+                self.assertEqual(proxy.upstream_base, base)
+                self.assertEqual(proxy.target_path("/chat"), expected)
+
+    def test_userinfo_and_fragment_are_rejected_instead_of_dropped(self):
+        for url in (
+            "https://user:secret@host/v1",
+            "https://host/v1#fragment",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(ValueError):
+                    RetryProxy(url)
+
+
+class OpenFailureTests(unittest.TestCase):
+    def test_a_failed_request_closes_the_connection(self):
+        closed = []
+
+        class FakeConnection:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def request(self, *args, **kwargs):
+                raise OSError("connect refused")
+
+            def close(self):
+                closed.append(True)
+
+        proxy = RetryProxy("http://127.0.0.1:1/v1")
+        with mock.patch.object(http.client, "HTTPConnection", FakeConnection):
+            with self.assertRaises(OSError):
+                proxy.open("POST", "/v1/chat", {}, b"{}")
+        self.assertTrue(closed)
+
+
+class SuccessCloseTests(unittest.TestCase):
+    def test_the_success_path_closes_the_response_and_connection(self):
+        class FakeResponse:
+            def __init__(self):
+                self.payload = [b"ok"]
+                self.closed = False
+
+            def read(self, size=-1):
+                return self.payload.pop(0) if self.payload else b""
+
+            def close(self):
+                self.closed = True
+
+        class FakeConnection:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        response = FakeResponse()
+        connection = FakeConnection()
+        proxy = RetryProxy("http://127.0.0.1:1/v1")
+        proxy.open = mock.Mock(return_value=(200, [], response, connection))
+        base = proxy.start()
+        try:
+            with urllib.request.urlopen(base + "/v1/chat", timeout=5) as reply:
+                self.assertEqual(reply.status, 200)
+                self.assertEqual(reply.read(), b"ok")
+        finally:
+            proxy.stop()
+        self.assertTrue(response.closed)
+        self.assertTrue(connection.closed)
+
+
+class _CountingUpstream(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):  # noqa: A003 - stdlib name
+        return
+
+    def do_POST(self):  # noqa: N802 - stdlib name
+        self.server.hits = getattr(self.server, "hits", 0) + 1
+        payload = b"{}"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+class InvalidContentLengthTests(unittest.TestCase):
+    def test_an_invalid_content_length_is_rejected_before_forwarding(self):
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _CountingUpstream)
+        upstream.hits = 0
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        proxy = RetryProxy("http://127.0.0.1:%d/v1" % upstream.server_address[1])
+        base = proxy.start()
+        try:
+            parsed = urllib.parse.urlsplit(base)
+            connection = http.client.HTTPConnection(
+                parsed.hostname, parsed.port, timeout=5
+            )
+            connection.putrequest("POST", "/v1/chat/completions")
+            connection.putheader("Content-Length", "abc")
+            connection.endheaders()
+            response = connection.getresponse()
+            self.assertEqual(response.status, 400)
+            response.read()
+            connection.close()
+            self.assertEqual(upstream.hits, 0)
+        finally:
+            proxy.stop()
+            upstream.shutdown()
+            upstream.server_close()
+
+
+class _DuplicateHeaderUpstream(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):  # noqa: A003 - stdlib name
+        return
+
+    def do_POST(self):  # noqa: N802 - stdlib name
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.send_header("Server", "upstream-server")
+        self.send_header("Date", "Thu, 01 Jan 1970 00:00:00 GMT")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+
+class DuplicateResponseHeaderTests(unittest.TestCase):
+    def test_the_retry_proxy_emits_one_server_and_date_pair(self):
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _DuplicateHeaderUpstream)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        proxy = RetryProxy("http://127.0.0.1:%d/v1" % upstream.server_address[1])
+        base = proxy.start()
+        try:
+            parsed = urllib.parse.urlsplit(base)
+            connection = http.client.HTTPConnection(
+                parsed.hostname, parsed.port, timeout=5
+            )
+            connection.request("POST", "/v1/chat", body=b"{}")
+            response = connection.getresponse()
+            response.read()
+            names = [name.lower() for name, _ in response.getheaders()]
+            self.assertEqual(names.count("server"), 1)
+            self.assertEqual(names.count("date"), 1)
+            connection.close()
+        finally:
+            proxy.stop()
+            upstream.shutdown()
+            upstream.server_close()
 
 
 class _SlowErrorBody(BaseHTTPRequestHandler):

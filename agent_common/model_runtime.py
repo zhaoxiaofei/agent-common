@@ -38,6 +38,12 @@ if __package__:
         DOTS_WIRE_EFFORT,
         RetrySchedule,
         dots_compaction,
+        _PROXY_REGISTRY as _SHARED_PROXY_REGISTRY,
+        _forwardable_request_headers,
+        _forwardable_response_headers,
+        _read_request_body,
+        _relay_response_body,
+        _request_is_chunked,
         dots_dsh_overlay,
         load_policy as _load_llm_policy,
         retry_policy_yaml,
@@ -49,6 +55,12 @@ else:  # pragma: no cover - a paper-refine frozen root has no package
         DOTS_WIRE_EFFORT,
         RetrySchedule,
         dots_compaction,
+        _PROXY_REGISTRY as _SHARED_PROXY_REGISTRY,
+        _forwardable_request_headers,
+        _forwardable_response_headers,
+        _read_request_body,
+        _relay_response_body,
+        _request_is_chunked,
         dots_dsh_overlay,
         load_policy as _load_llm_policy,
         retry_policy_yaml,
@@ -245,6 +257,19 @@ AGENT_MODELS: Dict[str, Dict[str, Any]] = {
 #: matrix stay in ``AGENT_MODELS``.
 _MODEL_CATALOG_PATH = Path(__file__).with_name("model_catalog.json")
 
+#: Facts owned by the shared catalog.  Every reload drops them before applying
+#: the new document, so a value the new catalog no longer supplies cannot
+#: survive as a stale overlay.
+_CATALOG_OWNED_MODEL_KEYS = (
+    "context_window",
+    "max_tokens",
+    "chat_max_tokens",
+    "default_reasoning_level",
+    "dsh_provider",
+    "base_url",
+    "api_key_env",
+)
+
 
 def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
     """Overwrite each model's facts from the shared catalog, atomically.
@@ -255,8 +280,19 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
     try:
         with _MODEL_CATALOG_PATH.open(encoding="utf-8") as handle:
             document = json.load(handle)
-        by_id = {entry["id"]: entry for entry in document["models"]}
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for entry in document["models"]:
+            model_id = entry["id"]
+            if model_id in by_id:
+                # check_model_catalog rejects duplicates, but the runtime used
+                # to keep whichever entry came last.
+                raise ConfigError(
+                    "duplicate model id %r in %s"
+                    % (model_id, _MODEL_CATALOG_PATH)
+                )
+            by_id[model_id] = entry
         pending: Dict[str, Dict[str, Any]] = {}
+        stale: Dict[str, Tuple[str, ...]] = {}
         for name, entry in models.items():
             facts = by_id.get(entry["id"])
             if facts is None:
@@ -309,7 +345,15 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
             if facts.get("api_key_env"):
                 update["api_key_env"] = str(facts["api_key_env"])
             pending[name] = update
+            # A field the previous catalog supplied must disappear when the new
+            # catalog omits it; an overlay would otherwise leave it stale and
+            # _refresh_catalog_constants would re-export the old value.
+            stale[name] = tuple(
+                key for key in _CATALOG_OWNED_MODEL_KEYS if key not in update
+            )
         for name, update in pending.items():
+            for key in stale[name]:
+                models[name].pop(key, None)
             models[name].update(update)
     except FileNotFoundError as exc:
         # A checkout refreshed from upstream may not carry the catalog yet (the
@@ -368,13 +412,19 @@ AGENT_MODEL_CHOICES: Tuple[str, ...] = tuple(AGENT_MODELS) + (MODEL_DEFAULT,)
 #: Capacity numbers resolved from the shared catalog (authoritative).
 QWEN_CONTEXT_WINDOW = int(AGENT_MODELS["qwen38-27b"]["context_window"])
 QWEN_MAX_TOKENS = int(AGENT_MODELS["qwen38-27b"]["max_tokens"])
-QWEN_CHAT_MAX_TOKENS = int(AGENT_MODELS["qwen38-27b"]["chat_max_tokens"])
+QWEN_CHAT_MAX_TOKENS = int(
+    AGENT_MODELS["qwen38-27b"].get("chat_max_tokens") or QWEN_MAX_TOKENS
+)
 DOTS_CONTEXT_WINDOW = int(AGENT_MODELS["dots3-note-preview"]["context_window"])
 DOTS_MAX_TOKENS = int(AGENT_MODELS["dots3-note-preview"]["max_tokens"])
-DOTS_CHAT_MAX_TOKENS = int(AGENT_MODELS["dots3-note-preview"]["chat_max_tokens"])
+DOTS_CHAT_MAX_TOKENS = int(
+    AGENT_MODELS["dots3-note-preview"].get("chat_max_tokens") or DOTS_MAX_TOKENS
+)
 DEEPSEEK_CONTEXT_WINDOW = int(AGENT_MODELS["deepseek-flash"]["context_window"])
 DEEPSEEK_MAX_TOKENS = int(AGENT_MODELS["deepseek-flash"]["max_tokens"])
-DEEPSEEK_CHAT_MAX_TOKENS = int(AGENT_MODELS["deepseek-flash"]["chat_max_tokens"])
+DEEPSEEK_CHAT_MAX_TOKENS = int(
+    AGENT_MODELS["deepseek-flash"].get("chat_max_tokens") or DEEPSEEK_MAX_TOKENS
+)
 
 #: Per-request retry and compaction-key policy.  The canonical file lives in
 #: ``repos/agent-common/agent_common/llm_policy.json``; the submodule copy beside this module
@@ -511,13 +561,19 @@ def _refresh_catalog_constants() -> None:
 
     QWEN_CONTEXT_WINDOW = int(AGENT_MODELS["qwen38-27b"]["context_window"])
     QWEN_MAX_TOKENS = int(AGENT_MODELS["qwen38-27b"]["max_tokens"])
-    QWEN_CHAT_MAX_TOKENS = int(AGENT_MODELS["qwen38-27b"]["chat_max_tokens"])
+    QWEN_CHAT_MAX_TOKENS = int(
+        AGENT_MODELS["qwen38-27b"].get("chat_max_tokens") or QWEN_MAX_TOKENS
+    )
     DOTS_CONTEXT_WINDOW = int(AGENT_MODELS["dots3-note-preview"]["context_window"])
     DOTS_MAX_TOKENS = int(AGENT_MODELS["dots3-note-preview"]["max_tokens"])
-    DOTS_CHAT_MAX_TOKENS = int(AGENT_MODELS["dots3-note-preview"]["chat_max_tokens"])
+    DOTS_CHAT_MAX_TOKENS = int(
+        AGENT_MODELS["dots3-note-preview"].get("chat_max_tokens") or DOTS_MAX_TOKENS
+    )
     DEEPSEEK_CONTEXT_WINDOW = int(AGENT_MODELS["deepseek-flash"]["context_window"])
     DEEPSEEK_MAX_TOKENS = int(AGENT_MODELS["deepseek-flash"]["max_tokens"])
-    DEEPSEEK_CHAT_MAX_TOKENS = int(AGENT_MODELS["deepseek-flash"]["chat_max_tokens"])
+    DEEPSEEK_CHAT_MAX_TOKENS = int(
+        AGENT_MODELS["deepseek-flash"].get("chat_max_tokens") or DEEPSEEK_MAX_TOKENS
+    )
     QWEN_DEFAULT_BASE_URL = str(
         AGENT_MODELS["qwen38-27b"].get("base_url") or "http://127.0.0.1:8000/v1"
     )
@@ -1014,6 +1070,25 @@ class AgentSelection:
     def is_legacy(self) -> bool:
         return bool(self.legacy)
 
+    def __repr__(self) -> str:
+        """The auto-generated repr, with an endpoint's credentials redacted.
+
+        ``api_key`` was already ``repr=False``, but an endpoint selection keeps
+        the raw URL (including userinfo/query) for the live request; printing
+        the selection must not write that credential to a log.
+        """
+        model = self.model
+        if self.is_endpoint and model is not None:
+            try:
+                model = redact_endpoint_url(str(model))
+            except (TypeError, ValueError):
+                model = "<redacted endpoint>"
+        return (
+            "AgentSelection(harness=%r, model=%r, legacy=%r, model_name=%r, "
+            "prep_json=%r)"
+            % (self.harness, model, self.legacy, self.model_name, self.prep_json)
+        )
+
     @property
     def label(self) -> str:
         return agent_selection_label(self.harness, self.model)
@@ -1229,6 +1304,28 @@ def redact_endpoint_url(url: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
+def _safe_endpoint_text(text: str) -> str:
+    """Strip a URL-shaped string's authority userinfo, query and fragment.
+
+    Used when the value cannot be parsed as an absolute HTTP(S) URL (a malformed
+    or scheme-relative ``PAPER_*_BASE_URL``).  The generated patch/argv/
+    environment are persisted artifacts, so the credential-bearing part must be
+    removed textually rather than returned verbatim.
+    """
+    safe = text.split("#", 1)[0].split("?", 1)[0]
+    prefix = ""
+    rest = safe
+    if "://" in rest:
+        scheme, _, rest = rest.partition("://")
+        prefix = scheme + "://"
+    elif rest.startswith("//"):
+        prefix = "//"
+        rest = rest[2:]
+    authority, separator, tail = rest.partition("/")
+    authority = authority.rsplit("@", 1)[-1]
+    return prefix + authority + separator + tail
+
+
 def split_endpoint_credentials(url: str) -> Tuple[str, str]:
     """Split a credential-bearing endpoint into (safe URL, secret).
 
@@ -1252,8 +1349,16 @@ def split_endpoint_credentials(url: str) -> Tuple[str, str]:
     try:
         parsed = urllib.parse.urlsplit(text)
     except ValueError:
-        return text, ""
+        # The URL is malformed (for example ``[bad``), but the caller's artifact
+        # must still never receive the credential-bearing part.  Strip it
+        # textually, mirroring endpoint_base's fallback.
+        return _safe_endpoint_text(text), ""
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        # A scheme-relative (``//user:pw@host/v1``) or non-http(s) form cannot be
+        # used as an endpoint, but it must not leak a credential or query secret
+        # into the generated patch/argv/environment either.
+        if endpoint_credentials(text):
+            return _safe_endpoint_text(text), ""
         return text, ""
     secret = ""
     netloc = parsed.netloc
@@ -1424,9 +1529,12 @@ def endpoint_credentials(url: str) -> str:
     """A short description of the credential a URL carries, or "".
 
     Userinfo (``user:secret@host``) and a credential-named query parameter are
-    both rejected before a run: neither can be honoured by the generated DSH
-    patch (which carries no query string) and both would be written to the run
-    record.  A non-secret query parameter such as ``?model=`` stays allowed.
+    both rejected before a run: neither can be carried by the generated DSH
+    patch (which has no query string), so the credential must be passed
+    separately through ``--agent-model-api-key`` / the key environment.  Run
+    records are redacted by ``to_record``; the rejection is about the live
+    request, not about persisting the value.  A non-secret query parameter such
+    as ``?model=`` stays allowed.
 
     Example:
         ``endpoint_credentials("https://host/v1?api_key=x")`` returns
@@ -1485,8 +1593,19 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class _EndpointProbeError(Exception):
+    """The endpoint's ``/models`` listing could not be read."""
+
+
 def _endpoint_catalog(base_url: str, api_key: str = "", timeout: float = 5.0) -> List[Dict[str, Any]]:
-    """The endpoint's ``/models`` entries (an empty list when it exposes none)."""
+    """The endpoint's ``/models`` entries (an empty list when it exposes none).
+
+    A ``404``/``405`` response means the endpoint serves no listing route, which
+    is the documented "no listing" case and returns an empty list.  A failed
+    probe raises :class:`_EndpointProbeError` instead of looking like an empty
+    listing: a 401/500/network failure must not be reported as "the endpoint
+    lists no models" and silently fall back to ``default``.
+    """
     if not base_url:
         return []
     headers = {"Content-Type": "application/json"}
@@ -1499,16 +1618,29 @@ def _endpoint_catalog(base_url: str, api_key: str = "", timeout: float = 5.0) ->
         opener = urllib.request.build_opener(_NoRedirectHandler)
         with opener.open(request, timeout=timeout) as response:
             body = json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 405):
+            # The endpoint serves no listing route; that is the documented
+            # "no listing" case, not a failed probe.  A keyless local proxy
+            # commonly serves only /chat/completions.
+            return []
+        raise _EndpointProbeError(
+            "the endpoint /models listing failed with HTTP %d; check the API "
+            "key and that the endpoint serves an OpenAI-compatible /models "
+            "route" % exc.code
+        ) from None
     except (
         urllib.error.URLError,
         OSError,
         ValueError,
         TypeError,
         http.client.HTTPException,
-    ):
-        # BadStatusLine/IncompleteRead are HTTPException, not OSError; a malformed upstream
-        # response must yield an empty catalog, not escape as an internal error.
-        return []
+    ) as exc:
+        # BadStatusLine/IncompleteRead are HTTPException, not OSError.  A
+        # malformed upstream response is a probe failure, not an empty listing.
+        raise _EndpointProbeError(
+            "the endpoint /models listing failed: %s" % exc
+        ) from None
     data = body.get("data") if isinstance(body, dict) else None
     return [item for item in (data or []) if isinstance(item, dict) and item.get("id")]
 
@@ -1526,7 +1658,9 @@ def _endpoint_context(entries: Sequence[Mapping[str, Any]], model: str) -> Optio
         ):
             try:
                 value = int(entry.get(key))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                # ``1e400`` parses to float('inf'), and int(inf) raises
+                # OverflowError rather than ValueError.
                 continue
             if value > 0:
                 return value
@@ -1548,13 +1682,24 @@ def resolve_endpoint_model(
 
     Counterexample:
         A named (non-URL) model returns an empty resolution; do not call this for
-        catalog models.
+        catalog models.  A failed ``/models`` probe returns an error rather than
+        the ``default`` fallback, because a 401/500/network failure is not an
+        empty listing.
     """
+    if not selection.is_endpoint:
+        return "", None, ""
     if selection.model_name:
         if not probe:
             return selection.model_name, None, ""
         key = api_key or selection.api_key or _env(AGENT_MODEL_API_KEY_ENV)
-        entries = _endpoint_catalog(endpoint_base(str(selection.model or "")), key)
+        try:
+            entries = _endpoint_catalog(
+                endpoint_base(str(selection.model or "")), key
+            )
+        except _EndpointProbeError:
+            # The caller named the model explicitly, so a probe failure only
+            # costs the optional context window.
+            return selection.model_name, None, ""
         return selection.model_name, _endpoint_context(entries, selection.model_name), ""
     query_model = endpoint_query_model(str(selection.model or ""))
     if query_model:
@@ -1562,7 +1707,10 @@ def resolve_endpoint_model(
     if not probe:
         return "default", None, ""
     key = api_key or selection.api_key or _env(AGENT_MODEL_API_KEY_ENV)
-    entries = _endpoint_catalog(endpoint_base(str(selection.model or "")), key)
+    try:
+        entries = _endpoint_catalog(endpoint_base(str(selection.model or "")), key)
+    except _EndpointProbeError as exc:
+        return "", None, str(exc)
     models = [str(entry.get("id")) for entry in entries]
     if len(models) == 1:
         return models[0], _endpoint_context(entries, models[0]), ""
@@ -1648,17 +1796,9 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
         return base + path
 
     def _forward(self, method: str, body: Optional[bytes] = None) -> None:
-        headers = {}
-        for key, value in self.headers.items():
-            if key.lower() in (
-                "host",
-                "content-length",
-                "connection",
-                "transfer-encoding",
-                "accept-encoding",
-            ):
-                continue
-            headers[key] = value
+        headers = _forwardable_request_headers(
+            self.headers, extra_skip=("accept-encoding",)
+        )
         if body is not None:
             headers["Content-Length"] = str(len(body))
         request = urllib.request.Request(
@@ -1711,27 +1851,14 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(raw)
             return
         self.send_response(getattr(response, "status", 200))
-        for key, value in response.headers.items():
-            if key.lower() in (
-                "transfer-encoding",
-                "connection",
-                "content-length",
-            ):
-                continue
+        for key, value in _forwardable_response_headers(response.headers.items()):
             self.send_header(key, value)
         self.end_headers()
         try:
-            read_chunk = getattr(response, "read1", response.read)
-            while True:
-                chunk = read_chunk(65536)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-        except (OSError, ValueError, http.client.HTTPException):
-            # The response headers are already on the wire, so a structured 502 cannot replace
-            # them; close the truncated response instead of letting the handler thread die.
-            pass
+            _relay_response_body(
+                response,
+                lambda chunk: (self.wfile.write(chunk), self.wfile.flush()),
+            )
         finally:
             with contextlib.suppress(OSError):
                 response.close()
@@ -1740,8 +1867,7 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
         self._forward("GET")
 
     def _chunked(self) -> bool:
-        transfer = str(self.headers.get("Transfer-Encoding") or "").lower()
-        return "chunked" in transfer
+        return _request_is_chunked(self.headers)
 
     def do_POST(self) -> None:
         if self._chunked():
@@ -1764,10 +1890,20 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(raw)
             return
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except (TypeError, ValueError):
-            length = 0
-        body = self.rfile.read(length) if length else b""
+            body = _read_request_body(self.rfile, self.headers) or b""
+        except ValueError:
+            # Do not treat an unparsable Content-Length as an empty body and
+            # forward a corrupted request.
+            raw = json.dumps(
+                {"error": {"message": "invalid Content-Length header"}}
+            ).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            with contextlib.suppress(OSError):
+                self.wfile.write(raw)
+            return
         prep = getattr(self.server, "prep", None)  # type: ignore[attr-defined]
         if prep and body:
             try:
@@ -1780,11 +1916,10 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
         self._forward("POST", body)
 
 
-#: Proxies started by this process.  ``stop_prep_proxy`` accepts one server so
+#: The prep proxies live in the same process-wide registry as the retry
+#: proxies, tagged ``prep``; ``stop_prep_proxy`` accepts one server so
 #: concurrent verifier passes can stop only their own proxy.
-_ACTIVE_PROXIES: set = set()
-_PROXY_BY_BASE: Dict[str, Any] = {}
-_PROXY_LOCK = threading.Lock()
+_PROXY_BY_BASE: Dict[str, Any] = _SHARED_PROXY_REGISTRY.by_base
 
 
 def start_prep_proxy(target_base: str, prep: Mapping[str, Any]) -> Tuple[str, str]:
@@ -1799,51 +1934,48 @@ def start_prep_proxy(target_base: str, prep: Mapping[str, Any]) -> Tuple[str, st
 
     Counterexample:
         An empty prep object still starts a proxy if called directly; callers
-        should skip it when there is nothing to merge.
+        should skip it when there is nothing to merge.  An empty or non-http(s)
+        target returns ``("", error)`` and starts nothing.
     """
+    try:
+        normalized_target = endpoint_base(str(target_base or ""))
+    except ConfigError as exc:
+        return "", str(exc)
     try:
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _PrepProxyHandler)
     except OSError as exc:
         return "", "%s: %s" % (type(exc).__name__, exc)
-    server.target_base = target_base.rstrip("/")          # type: ignore[attr-defined]
+    server.target_base = normalized_target                  # type: ignore[attr-defined]
     server.prep = dict(prep)                              # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     server._gdp_thread = thread                           # type: ignore[attr-defined]
     base = "http://127.0.0.1:%s/v1" % server.server_address[1]
-    with _PROXY_LOCK:
-        _ACTIVE_PROXIES.add(server)
-        _PROXY_BY_BASE[base] = server
+    _SHARED_PROXY_REGISTRY.add(server, kind="prep", base=base)
     return base, ""
 
 
 def stop_prep_proxy(server: Any = None) -> None:
-    """Stop one proxy, or every proxy this process started when omitted.
+    """Stop one prep proxy, or every prep proxy this process started when omitted.
 
     ``server`` may be the base URL returned by :func:`start_prep_proxy`; parallel
     verifier passes each stop only their own proxy.
 
     Example:
         ``stop_prep_proxy(base)`` stops the proxy for that base URL;
-        ``stop_prep_proxy()`` stops all this process started.
+        ``stop_prep_proxy()`` stops every prep proxy this process started.
 
     Counterexample:
         Stopping an unknown base is a no-op; it does not raise.
     """
-    with _PROXY_LOCK:
-        if isinstance(server, str):
-            known = _PROXY_BY_BASE.pop(server, None)
-            if known is None:
-                # An unknown base URL is not "all proxies": the docstring's
-                # no-op counterexample.  Only an explicit None means stop all.
-                return
-            server = known
-        targets = [server] if server is not None else list(_ACTIVE_PROXIES)
-        for item in targets:
-            _ACTIVE_PROXIES.discard(item)
-            for base, known in list(_PROXY_BY_BASE.items()):
-                if known is item:
-                    _PROXY_BY_BASE.pop(base, None)
+    if isinstance(server, str):
+        # An unknown base URL is not "all proxies": the docstring's no-op
+        # counterexample.  Only an explicit None means stop all prep proxies.
+        targets = _SHARED_PROXY_REGISTRY.targets(base=server, kind="prep")
+    elif server is not None:
+        targets = _SHARED_PROXY_REGISTRY.targets(item=server)
+    else:
+        targets = _SHARED_PROXY_REGISTRY.targets(kind="prep")
     for item in targets:
         if item is None:
             continue
@@ -1901,6 +2033,7 @@ def start_compaction_proxy(
         RETRY_SCHEDULE,
         name="gdp-compaction",
         log=log_callback,
+        kind="compaction",
     )
 
 
@@ -1912,10 +2045,13 @@ def stop_compaction_proxy(proxy: Any = None) -> None:
         stops all.
 
     Counterexample:
-        A ``None`` argument means "all", not "none"; pass the specific proxy if you
-        only want to stop one.
+        A ``None`` argument means "all compaction proxies", not "none"; an
+        unrelated proxy started with ``start_retry_proxy()`` is not touched.
     """
-    stop_retry_proxy(proxy)
+    if proxy is None:
+        stop_retry_proxy(kind="compaction")
+    else:
+        stop_retry_proxy(proxy)
 
 
 # ---------------------------------------------------------------------------
@@ -2147,6 +2283,12 @@ def selection_problem(
         return ""
     settings = _provider_family_settings(selection)
     family = settings["family"]
+    if family == "endpoint":
+        # Run the same endpoint resolution the live request uses, so an
+        # ambiguous listing (or a failed /models probe) is reported here
+        # instead of surfacing as a plausible but wrong ``default`` model.
+        _model_name, _context_window, error = resolve_endpoint_model(selection)
+        return error
     if family == "deepseek" and selection.harness in (
         AGENT_HARNESS_GPT_CODEX,
         AGENT_HARNESS_CLAUDE_CODE,
@@ -2164,6 +2306,59 @@ def selection_problem(
             "key. Export DOTS_API_KEY (or PAPER_DOTS_API_KEY)."
         )
     return ""
+
+
+def _resolve_token_capacities(
+    settings: Mapping[str, Any],
+    context_window_override: Optional[int],
+    max_tokens_override: Optional[int],
+    default_context: int,
+    default_max_tokens: int,
+) -> Tuple[int, int]:
+    """Validated ``(context_window, max_tokens)`` for a generated patch.
+
+    ``None`` means "use the catalog/default"; an explicit zero or negative
+    value is rejected instead of being silently treated as unset, and a max
+    that does not fit inside the context window is rejected too.
+    """
+    context = (
+        settings.get("context_window")
+        if context_window_override is None
+        else context_window_override
+    )
+    max_tokens = (
+        settings.get("max_tokens")
+        if max_tokens_override is None
+        else max_tokens_override
+    )
+    if context is None:
+        context = default_context
+    if max_tokens is None:
+        max_tokens = default_max_tokens
+    try:
+        context = int(context)
+        max_tokens = int(max_tokens)
+    except (TypeError, ValueError):
+        raise ConfigError(
+            "the context window and max tokens must be integers"
+        ) from None
+    if context <= 0:
+        raise ConfigError(
+            "the context window must be positive, not %d" % context
+        )
+    if max_tokens <= 0:
+        raise ConfigError("max tokens must be positive, not %d" % max_tokens)
+    if max_tokens >= context:
+        raise ConfigError(
+            "max tokens %d must be below the context window %d"
+            % (max_tokens, context)
+        )
+    return context, max_tokens
+
+
+def _normalized_patch_base_url(value: Any) -> str:
+    """A credential-free, chat-completions-normalized provider base URL."""
+    return endpoint_base(str(value or ""))
 
 
 def dsh_patch_text(
@@ -2209,14 +2404,24 @@ def dsh_patch_text(
         )
         # The patch is a credential-free artifact: userinfo and a query string
         # belong to the live request, never to a file an agent can read.
-        base_url = redact_endpoint_url(base_url_override or settings["base_url"])
+        base_url = _normalized_patch_base_url(
+            base_url_override or settings["base_url"]
+        )
+        context_window, max_tokens = _resolve_token_capacities(
+            settings,
+            context_window_override,
+            max_tokens_override,
+            DEFAULT_ENDPOINT_CONTEXT,
+            DEFAULT_ENDPOINT_MAX_TOKENS,
+        )
+        provider = provider_override or "endpoint"
         return (
             (
                 "# Generated by generic_debug_pipeline for this stage: --agent-model.\n"
                 "- id: llm-pi-ai\n"
                 "  config:\n"
                 "    providers:\n"
-                "      endpoint:\n"
+                "      %s:\n"
             '        displayName: "Custom API endpoint"\n'
             "        apiKeyEnv: %s\n"
             "        api: openai-completions\n"
@@ -2233,30 +2438,34 @@ def dsh_patch_text(
             + retry_policy_yaml(LLM_POLICY, "        ")
             + "- id: agent-default-model\n"
             "  config:\n"
-            "    provider: endpoint\n"
+            "    provider: %s\n"
             "    model: %s\n"
             )
             % (
+                provider,
                 endpoint_api_key_env or AGENT_MODEL_API_KEY_ENV,
                 json.dumps(base_url),
                 json.dumps(model_name),
                 json.dumps(model_name),
-                int(
-                    context_window_override
-                    or settings["context_window"]
-                    or DEFAULT_ENDPOINT_CONTEXT
-                ),
-                int(
-                    max_tokens_override
-                    or settings["max_tokens"]
-                    or DEFAULT_ENDPOINT_MAX_TOKENS
-                ),
+                context_window,
+                max_tokens,
+                provider,
                 json.dumps(model_name),
             )
         )
     if family == "qwen":
         model = raw_model or settings["model"]
-        provider = settings.get("provider") or "qwen"
+        provider = provider_override or settings.get("provider") or "qwen"
+        base_url = _normalized_patch_base_url(
+            base_url_override or settings["base_url"]
+        )
+        context_window, max_tokens = _resolve_token_capacities(
+            settings,
+            context_window_override,
+            max_tokens_override,
+            QWEN_CONTEXT_WINDOW,
+            QWEN_MAX_TOKENS,
+        )
         return (
             (
                 "# Generated by generic_debug_pipeline for this stage: --agent-model qwen38-27b.\n"
@@ -2290,14 +2499,10 @@ def dsh_patch_text(
                 provider,
                 json.dumps("Qwen vLLM (%s)" % model),
                 settings["api_key_env"],
-                json.dumps(base_url_override or settings["base_url"]),
+                json.dumps(base_url),
                 json.dumps(model),
-                int(
-                    context_window_override
-                    or settings["context_window"]
-                    or QWEN_CONTEXT_WINDOW
-                ),
-                int(max_tokens_override or settings["max_tokens"] or QWEN_MAX_TOKENS),
+                context_window,
+                max_tokens,
                 provider,
                 json.dumps(model),
                 json.dumps(
@@ -2312,21 +2517,30 @@ def dsh_patch_text(
         )
     if family == "dots":
         model = raw_model or settings["model"]
+        base_url = _normalized_patch_base_url(
+            base_url_override or settings["base_url"]
+        )
+        compaction_base = (
+            _normalized_patch_base_url(compaction_base_url)
+            if compaction_base_url
+            else None
+        )
+        context_window, max_tokens = _resolve_token_capacities(
+            settings,
+            context_window_override,
+            max_tokens_override,
+            DOTS_CONTEXT_WINDOW,
+            DOTS_MAX_TOKENS,
+        )
         return dots_dsh_overlay(
             LLM_POLICY,
             model=model,
-            provider=settings.get("provider") or "dots",
-            base_url=base_url_override or settings["base_url"],
-            context_window=int(
-                context_window_override
-                or settings["context_window"]
-                or DOTS_CONTEXT_WINDOW
-            ),
-            max_tokens=int(
-                max_tokens_override or settings["max_tokens"] or DOTS_MAX_TOKENS
-            ),
+            provider=provider_override or settings.get("provider") or "dots",
+            base_url=base_url,
+            context_window=context_window,
+            max_tokens=max_tokens,
             regular_api_key_env=settings["api_key_env"],
-            compaction_base_url=compaction_base_url,
+            compaction_base_url=compaction_base,
             reasoning_effort=str(
                 effort_override or settings["effort"] or DOTS_DEFAULT_EFFORT
             ),
@@ -2359,6 +2573,14 @@ def dsh_patch_text(
             )
         )
     info = selection.model_info()
+    if selection.is_default and raw_model:
+        # With the ``default`` sentinel the catalog selection is empty, but a
+        # raw model still names its family/provider (a raw GPT/Claude model
+        # must not fall through to the DeepSeek provider).
+        raw_info = AGENT_MODELS.get(normalize_agent_model(raw_model)) or {}
+        if raw_info:
+            info = dict(raw_info)
+            family = str(info.get("family") or family)
     model = raw_model or selection.effective_model_id() or selection.model or ""
     provider = (
         provider_override
@@ -2524,6 +2746,26 @@ def claude_model_arg(
     return str(raw_model) if raw_model else None
 
 
+def _claude_code_effort(level: Any) -> str:
+    """Translate a generic level to the vocabulary Claude Code accepts.
+
+    Claude Code accepts ``low``/``medium``/``high``/``max`` and silently ignores
+    anything else.  A Qwen ``max`` is normalized to the provider wire's
+    ``xhigh``, which Claude Code would ignore, so this route maps the *generic*
+    level instead.  ``off`` has no Claude Code spelling and is omitted.
+    """
+    text = str(level or "").strip().lower()
+    if text in ("", "off"):
+        return ""
+    if text == "minimal":
+        return "low"
+    if text == "xhigh":
+        return "max"
+    if text in ("low", "medium", "high", "max"):
+        return text
+    return ""
+
+
 def claude_environment(
     selection: Optional[AgentSelection], *, raw_model: Optional[str] = None
 ) -> Dict[str, str]:
@@ -2593,9 +2835,14 @@ def claude_environment(
     }
     # Only an explicit operator override adds the effort: these
     # Anthropic-compatible endpoints do not document the field, so the model's
-    # own default stays in place otherwise.
-    if reasoning_effort_override():
-        env["CLAUDE_CODE_EFFORT_LEVEL"] = str(settings["effort"])
+    # own default stays in place otherwise.  Translate the generic level, not
+    # the provider wire level (qwen ``max`` is wire ``xhigh``, which Claude Code
+    # ignores).
+    override = reasoning_effort_override()
+    if override:
+        claude_effort = _claude_code_effort(override)
+        if claude_effort:
+            env["CLAUDE_CODE_EFFORT_LEVEL"] = claude_effort
     return env
 
 
