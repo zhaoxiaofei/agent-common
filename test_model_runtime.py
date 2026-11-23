@@ -122,7 +122,12 @@ class DefaultReasoningLevelTests(unittest.TestCase):
         self.assertIn('model_reasoning_effort="medium"', qwen)
         self.assertEqual(
             model_runtime.codex_provider_args(self.selection("gpt-sol")),
-            ["-c", 'model_provider="openai"'],
+            [
+                "-c",
+                'model_provider="openai"',
+                "-c",
+                'model="gpt-6.1-sol"',
+            ],
         )
 
     def test_the_operator_override_still_wins(self):

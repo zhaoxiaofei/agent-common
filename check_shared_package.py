@@ -56,7 +56,18 @@ def main() -> int:
         for name in sorted(canonical):
             if name not in copy:
                 problems.append("missing copy: %s" % (directory / name))
-            elif digest(copy[name]) != digest(canonical[name]):
+                continue
+            try:
+                copy_digest = digest(copy[name])
+                canonical_digest = digest(canonical[name])
+            except OSError as exc:
+                # An unreadable file is a specific FAIL, not a traceback that
+                # aborts the whole shared-package check.
+                problems.append(
+                    "cannot read %s: %s" % (directory / name, exc)
+                )
+                continue
+            if copy_digest != canonical_digest:
                 problems.append("copy differs from canonical: %s" % (directory / name))
         for name in sorted(set(copy) - set(canonical)):
             problems.append("unexpected file in copy: %s" % (directory / name))

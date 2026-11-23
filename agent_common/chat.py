@@ -97,9 +97,11 @@ def message_text(content: object) -> str:
         return content
     if isinstance(content, (list, tuple)):
         return "".join(
-            str(part.get("text") or "")
+            part["text"]
             for part in content
-            if isinstance(part, dict) and part.get("type") == "text"
+            if isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
         )
     return ""
 

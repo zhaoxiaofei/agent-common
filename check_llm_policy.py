@@ -9,8 +9,9 @@ behaviour that matters:
 
 * the schedule is 10s, 20s, ... capped at 3600s (ten retries);
 * the compaction route names a second Dots key;
-* the paper-refine adapters that cannot import a sibling module carry the same
-  constants.
+* the embedded ``DEFAULT_POLICY`` fallback matches the canonical JSON;
+* the paper-refine adapters import the shared model runtime and use its retry
+  schedule / DSH patch generator rather than carrying a second copy.
 
     python3 repos/agent-common/check_llm_policy.py
 """
@@ -70,8 +71,11 @@ def main() -> int:
         )
 
     try:
+        canonical_digest = digest(CANONICAL_JSON)
         document = json.loads(CANONICAL_JSON.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
+        # RecursionError is not a ValueError; a deeply nested document used to
+        # escape this guard and crash the checker before it could print FAIL.
         print("FAIL cannot read canonical policy %s: %s" % (CANONICAL_JSON, exc))
         return 1
     if not isinstance(document, dict):
@@ -110,11 +114,18 @@ def main() -> int:
     multiplier = float(retry.get("multiplier", 0))
     maximum = float(retry.get("max_delay_seconds", 0))
     max_retries = int(retry.get("max_retries", 0))
-    schedule = [
-        min(initial * multiplier ** index, maximum)
-        for index in range(max_retries)
-    ]
-    if schedule != expected:
+    try:
+        schedule = [
+            min(initial * multiplier ** index, maximum)
+            for index in range(max_retries)
+        ]
+    except (OverflowError, TypeError, ValueError) as exc:
+        # ``_merge_policy`` accepts a finite but huge multiplier such as 1e308;
+        # the runtime's RetrySchedule.delay handles the overflow, so the
+        # checker must report it rather than crash.
+        problems.append("cannot derive the retry schedule: %s" % exc)
+        schedule = None
+    if schedule is not None and schedule != expected:
         problems.append("retry schedule is %r, expected %r" % (schedule, expected))
     if "RATE_LIMIT" not in (retry.get("retryable_error_codes") or []):
         problems.append("RATE_LIMIT is not retryable")
@@ -128,6 +139,14 @@ def main() -> int:
         problems.append("regular and compaction Dots keys are the same variable")
     if not dots.get("compaction_provider"):
         problems.append("no dedicated compaction provider is declared")
+    # ``llm_retry.py`` documents DEFAULT_POLICY as the fallback to keep in sync
+    # with this file; compare it (the metadata keys are intentionally absent).
+    for section in ("retry", "dots", "compaction"):
+        if document.get(section) != _llm_retry.DEFAULT_POLICY.get(section):
+            problems.append(
+                "canonical %s differs from llm_retry.DEFAULT_POLICY; keep the "
+                "embedded fallback in sync" % section
+            )
     compaction = document.get("compaction")
     if not isinstance(compaction, Mapping):
         compaction = {}
@@ -139,7 +158,16 @@ def main() -> int:
             copy = directory / name
             if not copy.is_file():
                 problems.append("missing copy: %s" % copy)
-            elif digest(copy) != digest(CANONICAL_DIR / name):
+                continue
+            try:
+                copy_digest = digest(copy)
+                canonical_digest = digest(CANONICAL_DIR / name)
+            except OSError as exc:
+                problems.append(
+                    "cannot read %s copy %s: %s" % (name, copy, exc)
+                )
+                continue
+            if copy_digest != canonical_digest:
                 problems.append("copy differs from canonical: %s" % copy)
 
     # The paper-refine adapters now consume the shared runtime rather than
@@ -169,7 +197,7 @@ def main() -> int:
         return 1
     print(
         "OK schedule %r; canonical and %d submodule checkouts share sha256 %s"
-        % (expected, len(COPIES), digest(CANONICAL_JSON)[:16])
+        % (expected, len(COPIES), canonical_digest[:16])
     )
     return 0
 

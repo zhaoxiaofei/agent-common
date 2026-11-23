@@ -69,10 +69,12 @@ def main() -> int:
     if not CANONICAL.is_file():
         print("missing canonical catalog: %s" % CANONICAL)
         return 1
-    expected = digest(CANONICAL)
     try:
+        expected = digest(CANONICAL)
         document = json.loads(CANONICAL.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
+        # RecursionError is not a ValueError; a deeply nested document used to
+        # escape this guard and crash the checker before it could print FAIL.
         print("FAIL cannot read canonical catalog %s: %s" % (CANONICAL, exc))
         return 1
     if not isinstance(document, dict):
@@ -82,8 +84,11 @@ def main() -> int:
     if not isinstance(models, list):
         print("FAIL canonical catalog models is not a list")
         return 1
-    if document.get("schema_version") != 1:
-        problems.append("unsupported schema_version %r" % document.get("schema_version"))
+    schema_version = document.get("schema_version")
+    # ``True == 1`` in Python, so an equality test alone accepted a boolean
+    # schema_version as the integer 1.
+    if type(schema_version) is not int or schema_version != 1:
+        problems.append("unsupported schema_version %r" % (schema_version,))
     seen = set()
     for entry in models:
         if not isinstance(entry, dict):
@@ -131,14 +136,19 @@ def main() -> int:
                 % (model_id, chat, output)
             )
         level = entry.get("default_reasoning_level")
-        if level is not None and level not in {
-            "minimal",
-            "low",
-            "medium",
-            "high",
-            "xhigh",
-            "max",
-        }:
+        # Check the type before set membership: a list/dict level is
+        # unhashable and used to abort the checker with a TypeError.
+        if level is not None and (
+            not isinstance(level, str)
+            or level not in {
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            }
+        ):
             problems.append(
                 "%s: bad default_reasoning_level %r" % (model_id, level)
             )
@@ -157,7 +167,15 @@ def main() -> int:
     for path in COPIES:
         if not path.is_file():
             problems.append("missing copy: %s" % path)
-        elif digest(path) != expected:
+            continue
+        try:
+            copy_digest = digest(path)
+        except OSError as exc:
+            # An unreadable copy is a specific FAIL, not a traceback that
+            # aborts every other check.
+            problems.append("cannot read copy %s: %s" % (path, exc))
+            continue
+        if copy_digest != expected:
             problems.append("copy differs from canonical: %s" % path)
     for model_id in sorted(EXPECTED_MODEL_IDS - seen):
         problems.append("missing expected model id %s" % model_id)

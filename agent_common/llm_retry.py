@@ -568,6 +568,14 @@ class _RetryProxyHandler(http.server.BaseHTTPRequestHandler):
                 status, headers, response, connection = proxy.open(
                     method, self.path, self.headers, body
                 )
+            except ValueError as exc:
+                # ``http.client`` encodes the request line as ASCII, so a
+                # non-ASCII path raises UnicodeEncodeError (a ValueError); the
+                # target_path validation above raises ValueError too.  Without
+                # this guard the handler thread died and the client got an
+                # empty response instead of a 4xx.
+                self._send_error(400, str(exc))
+                return
             except (
                 OSError,
                 TimeoutError,
@@ -749,7 +757,11 @@ class RetryProxy:
         raw_base = str(upstream_base)
         parsed = urllib.parse.urlsplit(raw_base)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            raise ValueError("upstream_base must be an http(s) URL: %r" % upstream_base)
+            # Do not echo the raw URL: the bad-scheme path runs before the
+            # userinfo check, so a URL such as ftp://user:secret@host would put
+            # the password into the exception text and any traceback that
+            # records it.
+            raise ValueError("upstream_base must be an http(s) URL with a host")
         if parsed.username is not None or parsed.password is not None:
             # The proxy never authenticates the upstream hop with URL userinfo;
             # accepting it and dropping it silently lost a caller's credential.
@@ -811,6 +823,15 @@ class RetryProxy:
             ``/v1/chat`` and ``/v1?x=1`` stays ``/v1?x=1``.
         """
         requested = path or "/"
+        # A loopback proxy receives origin-form targets (``/v1/chat``).  An
+        # absolute-form target (``http://other/v1/chat``) or a slash-less path
+        # must not be concatenated into a nonsense upstream path; reject it so
+        # the handler can answer 400.
+        parsed_request = urllib.parse.urlsplit(requested)
+        if parsed_request.scheme or parsed_request.netloc or requested.startswith("//"):
+            raise ValueError("absolute-form request targets are not supported")
+        if not requested.startswith("/"):
+            raise ValueError("request target must start with '/'")
         # Compare only the path component: ``/v1?x=1`` is already under a
         # ``/v1`` prefix even though it does not start with ``/v1/``.
         path_only = requested.split("?", 1)[0]

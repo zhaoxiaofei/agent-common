@@ -270,6 +270,242 @@ _CATALOG_OWNED_MODEL_KEYS = (
     "api_key_env",
 )
 
+#: Credentials split out of a catalog-provided base URL.  The public
+#: ``AGENT_MODELS`` table and the exported ``QWEN_*``/``DOTS_*`` constants
+#: stay credential-free; the live route reads the secret from here.
+_CATALOG_BASE_SECRETS: Dict[str, str] = {}
+
+
+def _safe_endpoint_text(text: str) -> str:
+    """Strip a URL-shaped string's authority userinfo, query and fragment.
+
+    Used when the value cannot be parsed as an absolute HTTP(S) URL (a malformed
+    or scheme-relative ``PAPER_*_BASE_URL``).  The generated patch/argv/
+    environment are persisted artifacts, so the credential-bearing part must be
+    removed textually rather than returned verbatim.
+    """
+    safe = text.split("#", 1)[0].split("?", 1)[0]
+    prefix = ""
+    rest = safe
+    if "://" in rest:
+        scheme, _, rest = rest.partition("://")
+        prefix = scheme + "://"
+    elif rest.startswith("//"):
+        prefix = "//"
+        rest = rest[2:]
+    authority, separator, tail = rest.partition("/")
+    authority = authority.rsplit("@", 1)[-1]
+    return prefix + authority + separator + tail
+
+
+def _carries_unparsed_credential(text: str) -> bool:
+    """Detect userinfo/credential query textually when ``urlsplit`` fails."""
+    without_fragment = text.split("#", 1)[0]
+    before_query, _, query = without_fragment.partition("?")
+    authority = before_query
+    if "://" in authority:
+        authority = authority.split("://", 1)[1]
+    elif authority.startswith("//"):
+        authority = authority[2:]
+    authority = authority.split("/", 1)[0]
+    if "@" in authority:
+        return True
+    if query:
+        try:
+            pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+        except ValueError:
+            pairs = []
+        if any(_credential_key(key) for key, _value in pairs):
+            return True
+    return False
+
+
+def _redacted_endpoint_text(value: Optional[str]) -> Optional[str]:
+    """Redact a URL-shaped stored value, leaving a plain model id unchanged."""
+    if value is None:
+        return None
+    text = str(value)
+    url_shaped = "://" in text or text.startswith("//")
+    if (
+        agent_model_is_endpoint(text)
+        or endpoint_credentials(text)
+        or (url_shaped and _carries_unparsed_credential(text))
+    ):
+        return redact_endpoint_url(text)
+    return value
+
+
+def split_endpoint_credentials(url: str) -> Tuple[str, str]:
+    """Split a credential-bearing endpoint into (safe URL, secret).
+
+    ``--agent-model`` accepts a URL whose userinfo or query string carries a
+    gateway credential.  A child process's argv is world-readable, so the
+    credential must not stay there.  The returned URL keeps the scheme, host,
+    port, path, fragment and every non-secret query parameter (notably
+    ``model=``); the first userinfo/query credential is returned for the
+    documented ``PAPER_AGENT_MODEL_API_KEY`` channel.  A URL with no
+    credential is returned unchanged with an empty secret.
+
+    Example:
+        ``split_endpoint_credentials("https://user:pw@host/v1?model=m")`` returns
+        the safe URL plus ``"pw"``.
+
+    Counterexample:
+        A URL without a credential returns the URL unchanged and an empty secret;
+        an empty secret is not an error.
+    """
+    text = str(url or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(text)
+    except ValueError:
+        # The URL is malformed (for example ``[bad``), but the caller's artifact
+        # must still never receive the credential-bearing part.  Strip it
+        # textually, mirroring endpoint_base's fallback.
+        return _safe_endpoint_text(text), ""
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        # A scheme-relative (``//user:pw@host/v1``) or non-http(s) form cannot be
+        # used as an endpoint, but it must not leak a credential or query secret
+        # into the generated patch/argv/environment either.
+        if endpoint_credentials(text):
+            return _safe_endpoint_text(text), ""
+        return text, ""
+    secret = ""
+    netloc = parsed.netloc
+    if "@" in netloc:
+        userinfo, _, host = netloc.rpartition("@")
+        if ":" in userinfo:
+            secret = userinfo.rsplit(":", 1)[1]
+        else:
+            secret = userinfo
+        netloc = host
+    kept: list[Tuple[str, str]] = []
+    if parsed.query:
+        try:
+            pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        except ValueError:
+            pairs = []
+        for key, value in pairs:
+            if _secret_query_key(key):
+                if not secret:
+                    secret = value
+                continue
+            kept.append((key, value))
+    query = urllib.parse.urlencode(kept) if kept else ""
+    return (
+        urllib.parse.urlunsplit(
+            (parsed.scheme, netloc, parsed.path, query, parsed.fragment)
+        ),
+        secret,
+    )
+
+
+#: Credential-looking names, compared after lowercasing and dropping every
+#: non-alphanumeric character.  This is the one predicate shared by the query
+#: splitter, the endpoint validator and the prep-object redactor, so a spelling
+#: cannot be a credential in one path and an ordinary parameter in another.
+_CREDENTIAL_KEY_NAMES = frozenset(
+    {
+        "key",
+        "apikey",
+        "apikeys",
+        "xapikey",
+        "token",
+        "tokens",
+        "accesstoken",
+        "accesstokens",
+        "authtoken",
+        "authtokens",
+        "apitoken",
+        "apitokens",
+        "secret",
+        "secrets",
+        "secretkey",
+        "secretkeys",
+        "privatekey",
+        "privatekeys",
+        "clientsecret",
+        "clientsecrets",
+        "password",
+        "passwd",
+        "credential",
+        "credentials",
+        "authorization",
+        "auth",
+        "bearer",
+        "accesskey",
+        "accesskeys",
+        "accesskeyid",
+        "subscriptionkey",
+    }
+)
+_CREDENTIAL_KEY_SUFFIXES = (
+    "_key",
+    "_token",
+    "_secret",
+    "_password",
+    "_passwd",
+    "_credential",
+    "_credentials",
+    "_authorization",
+    "_auth",
+    "_apikey",
+)
+
+
+def _credential_key(name: Any) -> bool:
+    """Whether a query/prep key looks like it carries a credential."""
+    text = str(name or "").strip().lower()
+    compact = "".join(character for character in text if character.isalnum())
+    if compact in _CREDENTIAL_KEY_NAMES:
+        return True
+    normalized = text.replace("-", "_").replace(" ", "_")
+    return normalized.endswith(_CREDENTIAL_KEY_SUFFIXES)
+
+
+def _secret_query_key(name: str) -> bool:
+    """Backward-compatible spelling of :func:`_credential_key` for query names."""
+    return _credential_key(name)
+
+
+#: Query keys that carry a credential are recognised by the shared
+#: :func:`_credential_key` predicate: the endpoint's key belongs in
+#: ``--agent-model-api-key`` / the key environment variable, not in the URL,
+#: because the URL is written to the generated patch and the run's own records.
+
+
+def endpoint_credentials(url: str) -> str:
+    """A short description of the credential a URL carries, or "".
+
+    Userinfo (``user:secret@host``) and a credential-named query parameter are
+    both rejected before a run: neither can be carried by the generated DSH
+    patch (which has no query string), so the credential must be passed
+    separately through ``--agent-model-api-key`` / the key environment.  Run
+    records are redacted by ``to_record``; the rejection is about the live
+    request, not about persisting the value.  A non-secret query parameter such
+    as ``?model=`` stays allowed.
+
+    Example:
+        ``endpoint_credentials("https://host/v1?api_key=x")`` returns
+        ``"query parameter 'api_key'"``.
+
+    Counterexample:
+        ``?model=x`` is not a credential and returns ``""``.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(str(url or "").strip())
+    except ValueError:
+        return ""
+    if parsed.username is not None or parsed.password is not None:
+        return "userinfo"
+    try:
+        pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return ""
+    for key, _value in pairs:
+        if _credential_key(key):
+            return "query parameter %r" % key
+    return ""
+
 
 def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
     """Overwrite each model's facts from the shared catalog, atomically.
@@ -277,10 +513,12 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
     Nothing is written until every model has been validated, so a later invalid
     entry cannot leave an earlier model half-updated.
     """
+    global _CATALOG_BASE_SECRETS
     try:
         with _MODEL_CATALOG_PATH.open(encoding="utf-8") as handle:
             document = json.load(handle)
         by_id: Dict[str, Dict[str, Any]] = {}
+        base_secrets: Dict[str, str] = {}
         for entry in document["models"]:
             model_id = entry["id"]
             if model_id in by_id:
@@ -341,7 +579,15 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
             if facts.get("provider"):
                 update["dsh_provider"] = str(facts["provider"])
             if facts.get("base_url"):
-                update["base_url"] = str(facts["base_url"])
+                # The catalog is a shared, agent-readable artifact.  Keep the
+                # public table and the exported constants credential-free and
+                # carry the live secret separately.
+                safe_base, base_secret = split_endpoint_credentials(
+                    str(facts["base_url"])
+                )
+                update["base_url"] = safe_base
+                if base_secret:
+                    base_secrets[name] = base_secret
             if facts.get("api_key_env"):
                 update["api_key_env"] = str(facts["api_key_env"])
             pending[name] = update
@@ -355,6 +601,7 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
             for key in stale[name]:
                 models[name].pop(key, None)
             models[name].update(update)
+        _CATALOG_BASE_SECRETS = dict(base_secrets)
     except FileNotFoundError as exc:
         # A checkout refreshed from upstream may not carry the catalog yet (the
         # adapter fallbacks below already document that case). Keep the table's
@@ -845,7 +1092,9 @@ def agent_model_label(model: Optional[str]) -> str:
         return "config-owned"
     if model == MODEL_DEFAULT:
         return "harness-default"
-    return "custom-endpoint" if agent_model_is_endpoint(model) else str(model)
+    if agent_model_is_endpoint(model):
+        return "custom-endpoint"
+    return str(_redacted_endpoint_text(model))
 
 
 def model_fact(model: Any, field: str, default: Any = None) -> Any:
@@ -1078,16 +1327,17 @@ class AgentSelection:
         the selection must not write that credential to a log.
         """
         model = self.model
-        if self.is_endpoint and model is not None:
+        if model is not None:
             try:
-                model = redact_endpoint_url(str(model))
+                model = _redacted_endpoint_text(model)
             except (TypeError, ValueError):
                 model = "<redacted endpoint>"
+        model_name = _redacted_endpoint_text(self.model_name)
         prep = redact_prep_object(dict(self.prep_json or {}))
         return (
             "AgentSelection(harness=%r, model=%r, legacy=%r, model_name=%r, "
             "prep_json=%r)"
-            % (self.harness, model, self.legacy, self.model_name, prep)
+            % (self.harness, model, self.legacy, model_name, prep)
         )
 
     @property
@@ -1143,15 +1393,15 @@ class AgentSelection:
             An endpoint's query string is stripped from the recorded model; the record
             is not a way to recover the live URL.
         """
-        record_model = (
-            redact_endpoint_url(str(self.model))
-            if self.is_endpoint and self.model is not None
-            else self.model
-        )
+        record_model = _redacted_endpoint_text(self.model)
+        # ``--agent-model-name`` is also a persisted value; a model name pasted
+        # as a URL must not smuggle userinfo/query credentials into the record.
+        record_model_name = _redacted_endpoint_text(self.model_name)
+        record_id = _redacted_endpoint_text(self.effective_model_id(raw_model))
         return {
             "harness": self.harness,
             "model": record_model,
-            "id": self.effective_model_id(raw_model),
+            "id": record_id,
             "legacy": self.legacy,
             # A caller may put a credential in the endpoint's query string. This record is
             # written to command.json and status.json, which every agent can read, so the
@@ -1160,7 +1410,7 @@ class AgentSelection:
             "endpoint": str(record_model)
             if self.is_endpoint and record_model is not None
             else None,
-            "model_name": self.model_name if self.is_endpoint else None,
+            "model_name": record_model_name if self.is_endpoint else None,
             "api_key_set": bool(
                 self.api_key
                 or (
@@ -1298,165 +1548,16 @@ def redact_endpoint_url(url: str) -> str:
         credential and the query.
     """
     text = str(url or "").strip()
-    parsed = urllib.parse.urlsplit(text)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        return text
-    netloc = parsed.netloc.rsplit("@", 1)[-1]
-    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
-
-
-def _safe_endpoint_text(text: str) -> str:
-    """Strip a URL-shaped string's authority userinfo, query and fragment.
-
-    Used when the value cannot be parsed as an absolute HTTP(S) URL (a malformed
-    or scheme-relative ``PAPER_*_BASE_URL``).  The generated patch/argv/
-    environment are persisted artifacts, so the credential-bearing part must be
-    removed textually rather than returned verbatim.
-    """
-    safe = text.split("#", 1)[0].split("?", 1)[0]
-    prefix = ""
-    rest = safe
-    if "://" in rest:
-        scheme, _, rest = rest.partition("://")
-        prefix = scheme + "://"
-    elif rest.startswith("//"):
-        prefix = "//"
-        rest = rest[2:]
-    authority, separator, tail = rest.partition("/")
-    authority = authority.rsplit("@", 1)[-1]
-    return prefix + authority + separator + tail
-
-
-def split_endpoint_credentials(url: str) -> Tuple[str, str]:
-    """Split a credential-bearing endpoint into (safe URL, secret).
-
-    ``--agent-model`` accepts a URL whose userinfo or query string carries a
-    gateway credential.  A child process's argv is world-readable, so the
-    credential must not stay there.  The returned URL keeps the scheme, host,
-    port, path, fragment and every non-secret query parameter (notably
-    ``model=``); the first userinfo/query credential is returned for the
-    documented ``PAPER_AGENT_MODEL_API_KEY`` channel.  A URL with no
-    credential is returned unchanged with an empty secret.
-
-    Example:
-        ``split_endpoint_credentials("https://user:pw@host/v1?model=m")`` returns
-        the safe URL plus ``"pw"``.
-
-    Counterexample:
-        A URL without a credential returns the URL unchanged and an empty secret;
-        an empty secret is not an error.
-    """
-    text = str(url or "").strip()
     try:
         parsed = urllib.parse.urlsplit(text)
     except ValueError:
-        # The URL is malformed (for example ``[bad``), but the caller's artifact
-        # must still never receive the credential-bearing part.  Strip it
-        # textually, mirroring endpoint_base's fallback.
-        return _safe_endpoint_text(text), ""
+        return _safe_endpoint_text(text)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        # A scheme-relative (``//user:pw@host/v1``) or non-http(s) form cannot be
-        # used as an endpoint, but it must not leak a credential or query secret
-        # into the generated patch/argv/environment either.
-        if endpoint_credentials(text):
-            return _safe_endpoint_text(text), ""
-        return text, ""
-    secret = ""
-    netloc = parsed.netloc
-    if "@" in netloc:
-        userinfo, _, host = netloc.rpartition("@")
-        if ":" in userinfo:
-            secret = userinfo.rsplit(":", 1)[1]
-        else:
-            secret = userinfo
-        netloc = host
-    kept: list[Tuple[str, str]] = []
-    if parsed.query:
-        try:
-            pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-        except ValueError:
-            pairs = []
-        for key, value in pairs:
-            if _secret_query_key(key):
-                if not secret:
-                    secret = value
-                continue
-            kept.append((key, value))
-    query = urllib.parse.urlencode(kept) if kept else ""
-    return (
-        urllib.parse.urlunsplit(
-            (parsed.scheme, netloc, parsed.path, query, parsed.fragment)
-        ),
-        secret,
-    )
-
-
-#: Credential-looking names, compared after lowercasing and dropping every
-#: non-alphanumeric character.  This is the one predicate shared by the query
-#: splitter, the endpoint validator and the prep-object redactor, so a spelling
-#: cannot be a credential in one path and an ordinary parameter in another.
-_CREDENTIAL_KEY_NAMES = frozenset(
-    {
-        "key",
-        "apikey",
-        "apikeys",
-        "xapikey",
-        "token",
-        "tokens",
-        "accesstoken",
-        "accesstokens",
-        "authtoken",
-        "authtokens",
-        "apitoken",
-        "apitokens",
-        "secret",
-        "secrets",
-        "secretkey",
-        "secretkeys",
-        "privatekey",
-        "privatekeys",
-        "clientsecret",
-        "clientsecrets",
-        "password",
-        "passwd",
-        "credential",
-        "credentials",
-        "authorization",
-        "auth",
-        "bearer",
-        "accesskey",
-        "accesskeys",
-        "accesskeyid",
-        "subscriptionkey",
-    }
-)
-_CREDENTIAL_KEY_SUFFIXES = (
-    "_key",
-    "_token",
-    "_secret",
-    "_password",
-    "_passwd",
-    "_credential",
-    "_credentials",
-    "_authorization",
-    "_auth",
-    "_apikey",
-)
-
-
-def _credential_key(name: Any) -> bool:
-    """Whether a query/prep key looks like it carries a credential."""
-    text = str(name or "").strip().lower()
-    compact = "".join(character for character in text if character.isalnum())
-    if compact in _CREDENTIAL_KEY_NAMES:
-        return True
-    normalized = text.replace("-", "_").replace(" ", "_")
-    return normalized.endswith(_CREDENTIAL_KEY_SUFFIXES)
-
-
-def _secret_query_key(name: str) -> bool:
-    """Backward-compatible spelling of :func:`_credential_key` for query names."""
-    return _credential_key(name)
+        # A scheme-relative, non-http or host-less URL still may carry
+        # userinfo/query credentials; the textual fallback removes them.
+        return _safe_endpoint_text(text)
+    netloc = parsed.netloc.rsplit("@", 1)[-1]
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
 def endpoint_base(url: str) -> str:
@@ -1521,46 +1622,6 @@ def endpoint_base(url: str) -> str:
         path = path.rstrip("/")
     netloc = parsed.netloc.rsplit("@", 1)[-1]
     return urllib.parse.urlunsplit((parsed.scheme, netloc, path, "", ""))
-
-
-#: Query keys that carry a credential are recognised by the shared
-#: :func:`_credential_key` predicate: the endpoint's key belongs in
-#: ``--agent-model-api-key`` / the key environment variable, not in the URL,
-#: because the URL is written to the generated patch and the run's own records.
-
-
-def endpoint_credentials(url: str) -> str:
-    """A short description of the credential a URL carries, or "".
-
-    Userinfo (``user:secret@host``) and a credential-named query parameter are
-    both rejected before a run: neither can be carried by the generated DSH
-    patch (which has no query string), so the credential must be passed
-    separately through ``--agent-model-api-key`` / the key environment.  Run
-    records are redacted by ``to_record``; the rejection is about the live
-    request, not about persisting the value.  A non-secret query parameter such
-    as ``?model=`` stays allowed.
-
-    Example:
-        ``endpoint_credentials("https://host/v1?api_key=x")`` returns
-        ``"query parameter 'api_key'"``.
-
-    Counterexample:
-        ``?model=x`` is not a credential and returns ``""``.
-    """
-    try:
-        parsed = urllib.parse.urlsplit(str(url or "").strip())
-    except ValueError:
-        return ""
-    if parsed.username is not None or parsed.password is not None:
-        return "userinfo"
-    try:
-        pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    except ValueError:
-        return ""
-    for key, _value in pairs:
-        if _credential_key(key):
-            return "query parameter %r" % key
-    return ""
 
 
 def endpoint_query_model(url: str) -> str:
@@ -1792,9 +1853,26 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args: Any) -> None:        # keep the adapter's stderr readable
         pass
 
+    def _send_error(self, status: int, message: str) -> None:
+        raw = json.dumps({"error": {"message": message}}).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        with contextlib.suppress(OSError):
+            self.wfile.write(raw)
+
     def _target(self) -> str:
         base = str(self.server.target_base).rstrip("/")  # type: ignore[attr-defined]
         path = self.path or "/"
+        try:
+            parsed_path = urllib.parse.urlsplit(path)
+        except ValueError as exc:
+            raise ValueError("invalid request target: %s" % exc) from None
+        if parsed_path.scheme or parsed_path.netloc or path.startswith("//"):
+            raise ValueError("absolute-form request targets are not supported")
+        if not path.startswith("/"):
+            raise ValueError("request target must start with '/'")
         # Compare only the path component: ``/v1?x=1`` is under /v1 even
         # though it does not start with ``/v1/``, and prefixing it as well
         # produced ``/v1/v1?x=1`` on the upstream.
@@ -1809,8 +1887,13 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
         )
         if body is not None:
             headers["Content-Length"] = str(len(body))
+        try:
+            target = self._target()
+        except ValueError as exc:
+            self._send_error(400, str(exc))
+            return
         request = urllib.request.Request(
-            self._target(), data=body, headers=headers, method=method
+            target, data=body, headers=headers, method=method
         )
         try:
             response = _PREP_OPENER.open(request, timeout=600.0)
@@ -1871,6 +1954,12 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
             with contextlib.suppress(OSError):
                 self.wfile.write(raw)
             return
+        except ValueError as exc:
+            # ``http.client`` encodes the request line as ASCII, so a non-ASCII
+            # path raises UnicodeEncodeError (a ValueError).  The client must
+            # get a 4xx, not an empty response and a dead handler thread.
+            self._send_error(400, str(exc))
+            return
         except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException) as exc:
             # ``BadStatusLine``/``IncompleteRead`` are ``http.client.HTTPException``, not
             # ``OSError``; without them a malformed upstream response escaped ``do_POST`` and
@@ -1885,9 +1974,23 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
             with contextlib.suppress(OSError):
                 self.wfile.write(raw)
             return
+        response_header_items = list(response.headers.items())
+        declared_length = next(
+            (
+                value
+                for name, value in response_header_items
+                if name.lower() == "content-length"
+            ),
+            None,
+        )
         self.send_response(getattr(response, "status", 200))
-        for key, value in _forwardable_response_headers(response.headers.items()):
+        for key, value in _forwardable_response_headers(response_header_items):
             self.send_header(key, value)
+        if declared_length is not None:
+            # ``_forwardable_response_headers`` drops the framing header; re-emit
+            # the upstream value so a truncated success body raises
+            # IncompleteRead on the client instead of looking like a short 200.
+            self.send_header("Content-Length", declared_length)
         self.end_headers()
         try:
             _relay_response_body(
@@ -1947,7 +2050,13 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
                 payload = None
             if isinstance(payload, dict):
                 deep_merge(payload, prep)
-                body = json.dumps(payload).encode("utf-8")
+                try:
+                    body = json.dumps(payload).encode("utf-8")
+                except (TypeError, ValueError) as exc:
+                    self._send_error(
+                        400, "prep object is not JSON-serialisable: %s" % exc
+                    )
+                    return
         self._forward("POST", body)
 
 
@@ -1972,16 +2081,35 @@ def start_prep_proxy(target_base: str, prep: Mapping[str, Any]) -> Tuple[str, st
         should skip it when there is nothing to merge.  An empty or non-http(s)
         target returns ``("", error)`` and starts nothing.
     """
+    target_text = str(target_base or "")
     try:
-        normalized_target = endpoint_base(str(target_base or ""))
+        _safe_target, target_secret = split_endpoint_credentials(target_text)
+    except (TypeError, ValueError):
+        _safe_target, target_secret = "", ""
+    if target_secret:
+        # ``endpoint_base`` strips userinfo for artifact safety; silently
+        # starting an unauthenticated proxy hides the lost credential until the
+        # first 401.  Reject it like RetryProxy does.
+        return "", (
+            "target_base must not carry a credential; pass it in the "
+            "forwarded Authorization header instead"
+        )
+    try:
+        normalized_target = endpoint_base(target_text)
     except ConfigError as exc:
         return "", str(exc)
+    try:
+        prep_object = dict(prep)
+        # Fail at startup, not inside the first request's handler thread.
+        json.dumps(prep_object)
+    except (TypeError, ValueError) as exc:
+        return "", "prep object is not JSON-serialisable: %s" % exc
     try:
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _PrepProxyHandler)
     except OSError as exc:
         return "", "%s: %s" % (type(exc).__name__, exc)
     server.target_base = normalized_target                  # type: ignore[attr-defined]
-    server.prep = dict(prep)                              # type: ignore[attr-defined]
+    server.prep = prep_object                              # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     server._gdp_thread = thread                           # type: ignore[attr-defined]
@@ -2157,6 +2285,8 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
         base_url, base_secret = _env_base_url(
             "PAPER_QWEN_BASE_URL", QWEN_DEFAULT_BASE_URL
         )
+        if not _env("PAPER_QWEN_BASE_URL"):
+            base_secret = _CATALOG_BASE_SECRETS.get("qwen38-27b") or base_secret
         key_env = str(
             model_fact("qwen38-27b", "api_key_env") or "PAPER_QWEN_API_KEY"
         )
@@ -2189,6 +2319,10 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
         base_url, base_secret = _env_base_url(
             "PAPER_DOTS_BASE_URL", DOTS_DEFAULT_BASE_URL
         )
+        if not _env("PAPER_DOTS_BASE_URL"):
+            base_secret = (
+                _CATALOG_BASE_SECRETS.get("dots3-note-preview") or base_secret
+            )
         return {
             "family": family,
             "provider": model_fact("dots3-note-preview", "dsh_provider") or "dots",
@@ -2396,6 +2530,21 @@ def _normalized_patch_base_url(value: Any) -> str:
     return endpoint_base(str(value or ""))
 
 
+def _normalized_route_base_url(value: Any) -> str:
+    """Normalize a route base URL, tolerating the legacy malformed forms.
+
+    ``dsh_patch_text`` uses :func:`endpoint_base` and fails on a malformed URL.
+    The Codex and Claude routes historically accepted the rstrip-only value and
+    kept a ``/chat/completions`` suffix; normalize it here so all three routes
+    agree, without turning a malformed legacy value into an exception.
+    """
+    text = str(value or "")
+    try:
+        return endpoint_base(text)
+    except ConfigError:
+        return text.rstrip("/")
+
+
 def dsh_patch_text(
     selection: AgentSelection,
     *,
@@ -2425,10 +2574,27 @@ def dsh_patch_text(
         ``selection.is_default`` with no raw model returns ``""`` (no patch); do
         not write an empty patch file.
     """
-    if selection.is_default and not raw_model:
+    if (selection.model is None or selection.is_default) and not raw_model:
+        # The CLI owns the model; the harness profile's own entry selects it.
         return ""
     settings = _provider_family_settings(selection)
     family = settings["family"]
+    raw_info: Dict[str, Any] = {}
+    if (selection.is_default or selection.model is None) and raw_model:
+        # The sentinel/legacy shape has no catalog entry of its own, but a raw
+        # model still names its family.  Resolve the family *before* the
+        # per-family builders so a raw qwen/dots/deepseek model gets the same
+        # provider block (base URL, key env, limits, effort) as a named one.
+        raw_info = AGENT_MODELS.get(normalize_agent_model(raw_model)) or {}
+        if raw_info:
+            inferred = AgentSelection(
+                harness=selection.harness,
+                model=normalize_agent_model(raw_model),
+                api_key=selection.api_key,
+                prep_json=selection.prep_json,
+            )
+            settings = _provider_family_settings(inferred)
+            family = settings["family"]
     if family == "endpoint":
         model_name = (
             raw_model
@@ -2437,6 +2603,7 @@ def dsh_patch_text(
             or endpoint_query_model(str(selection.model or ""))
             or "default"
         )
+        model_name = _redacted_endpoint_text(str(model_name)) or "default"
         # The patch is a credential-free artifact: userinfo and a query string
         # belong to the live request, never to a file an agent can read.
         base_url = _normalized_patch_base_url(
@@ -2489,7 +2656,7 @@ def dsh_patch_text(
             )
         )
     if family == "qwen":
-        model = raw_model or settings["model"]
+        model = _redacted_endpoint_text(raw_model) or settings["model"]
         provider = provider_override or settings.get("provider") or "qwen"
         base_url = _normalized_patch_base_url(
             base_url_override or settings["base_url"]
@@ -2551,7 +2718,7 @@ def dsh_patch_text(
             )
         )
     if family == "dots":
-        model = raw_model or settings["model"]
+        model = _redacted_endpoint_text(raw_model) or settings["model"]
         base_url = _normalized_patch_base_url(
             base_url_override or settings["base_url"]
         )
@@ -2581,7 +2748,11 @@ def dsh_patch_text(
             ),
         )
     if family == "deepseek":
-        model = raw_model or selection.effective_model_id() or settings["model"]
+        model = (
+            _redacted_endpoint_text(raw_model)
+            or selection.effective_model_id()
+            or settings["model"]
+        )
         effort = normalize_reasoning_effort(
             "deepseek-flash",
             effort_override or settings["effort"] or DEEPSEEK_DEFAULT_EFFORT,
@@ -2607,16 +2778,10 @@ def dsh_patch_text(
                 json.dumps(effort),
             )
         )
-    info = selection.model_info()
-    if selection.is_default and raw_model:
-        # With the ``default`` sentinel the catalog selection is empty, but a
-        # raw model still names its family/provider (a raw GPT/Claude model
-        # must not fall through to the DeepSeek provider).
-        raw_info = AGENT_MODELS.get(normalize_agent_model(raw_model)) or {}
-        if raw_info:
-            info = dict(raw_info)
-            family = str(info.get("family") or family)
-    model = raw_model or selection.effective_model_id() or selection.model or ""
+    info = dict(raw_info) if raw_info else selection.model_info()
+    model = _redacted_endpoint_text(
+        raw_model or selection.effective_model_id() or selection.model or ""
+    )
     provider = (
         provider_override
         or info.get("dsh_provider")
@@ -2632,9 +2797,11 @@ def dsh_patch_text(
         "    provider: %s" % json.dumps(provider),
         "    model: %s" % json.dumps(model),
     ]
-    if settings["effort"]:
+    effort = effort_override or settings["effort"]
+    if effort:
         lines.append(
-            "    reasoningEffort: %s" % json.dumps(str(settings["effort"]))
+            "    reasoningEffort: %s"
+            % json.dumps(normalize_reasoning_effort(model, str(effort)))
         )
     return "\n".join(lines) + "\n"
 
@@ -2652,14 +2819,29 @@ def codex_provider_args(
         chat-completions URL directly.
     """
     if selection.model is None or selection.is_default:
-        # The CLI owns the model, but an explicit level still reaches codex:
-        # `-c model_reasoning_effort` does not depend on the model id.
-        effort = reasoning_effort_override()
-        return (
-            ["-c", _codex_config("model_reasoning_effort", effort)]
-            if effort
-            else []
-        )
+        inferred = None
+        if raw_model:
+            raw_info = AGENT_MODELS.get(normalize_agent_model(raw_model)) or {}
+            if raw_info:
+                # A raw model names its family even when the selection is the
+                # sentinel/legacy shape; build the same provider args a named
+                # selection would.
+                inferred = AgentSelection(
+                    harness=selection.harness,
+                    model=normalize_agent_model(raw_model),
+                    api_key=selection.api_key,
+                    prep_json=selection.prep_json,
+                )
+        if inferred is None:
+            # The CLI owns the model, but an explicit level still reaches codex:
+            # `-c model_reasoning_effort` does not depend on the model id.
+            effort = reasoning_effort_override()
+            return (
+                ["-c", _codex_config("model_reasoning_effort", effort)]
+                if effort
+                else []
+            )
+        selection = inferred
     settings = _provider_family_settings(selection)
     family = settings["family"]
     model = raw_model or selection.effective_model_id() or settings["model"]
@@ -2671,6 +2853,8 @@ def codex_provider_args(
         # The model choice owns the provider too: a Codex config repointed at
         # another provider must not redirect a GPT model.
         values = [_codex_config("model_provider", "openai")]
+        if model:
+            values.append(_codex_config("model", model))
         if settings["effort"]:
             values.append(
                 _codex_config("model_reasoning_effort", settings["effort"])
@@ -2709,7 +2893,8 @@ def codex_provider_args(
                 "model_providers.qwen.name", "Qwen vLLM (%s)" % model
             ),
             _codex_config(
-                "model_providers.qwen.base_url", settings["base_url"]
+                "model_providers.qwen.base_url",
+                _normalized_route_base_url(settings["base_url"]),
             ),
             _codex_config(
                 "model_providers.qwen.env_key", settings["api_key_env"]
@@ -2731,7 +2916,8 @@ def codex_provider_args(
             _codex_config("model", model),
             _codex_config("model_providers.dots.name", "Dots API"),
             _codex_config(
-                "model_providers.dots.base_url", settings["base_url"]
+                "model_providers.dots.base_url",
+                _normalized_route_base_url(settings["base_url"]),
             ),
             _codex_config("model_providers.dots.env_key", settings["api_key_env"]),
             _codex_config("model_providers.dots.wire_api", "responses"),
@@ -2830,7 +3016,7 @@ def claude_environment(
         return {"CLAUDE_CODE_EFFORT_LEVEL": effort} if effort else {}
     if family == "endpoint":
         return {}
-    root = str(settings["base_url"] or "").rstrip("/")
+    root = _normalized_route_base_url(settings["base_url"])
     if root.endswith("/v1"):
         root = root[:-3]
     key = str(settings["api_key"] or "dummy")
@@ -2928,9 +3114,7 @@ def effective_agent_model(cmd: Sequence[Any]) -> Dict[str, Any]:
         model = _arg("--model")
         # A raw endpoint URL may carry userinfo/query credentials; the record
         # must keep only the scheme/host/path, exactly like to_record().
-        record_model = (
-            redact_endpoint_url(model) if agent_model_is_endpoint(model) else model
-        )
+        record_model = _redacted_endpoint_text(model)
         canonical = normalize_agent_model(model)
         info = AGENT_MODELS.get(canonical) or {}
         return {

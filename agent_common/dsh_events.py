@@ -93,6 +93,13 @@ def turn_end_failed(event: Any) -> Optional[bool]:
     # treated as success either (SUCCESS_STATUSES is an allowlist).
     if kind and kind not in SUCCESS_STATUSES:
         return True
+    # ``kind`` above is ``event.kind or reason.kind``; a stale successful
+    # top-level kind must not hide a failing reason.  Check the reason's own
+    # kind and its error payload independently.
+    if reason_kind and reason_kind not in SUCCESS_STATUSES:
+        return True
+    if isinstance(reason, Mapping) and turn_end_error(reason):
+        return True
     if status and status not in SUCCESS_STATUSES:
         return True
     if not status and not kind:

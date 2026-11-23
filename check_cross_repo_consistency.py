@@ -32,7 +32,9 @@ def _read_catalogue(path: Optional[Path] = None) -> tuple:
     path = CATALOG if path is None else path
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
+        # RecursionError is not a ValueError; a deeply nested document used to
+        # escape this guard and crash at import before main could report it.
         return {}, "cannot read catalog %s: %s" % (path, exc)
     if not isinstance(document, dict):
         return {}, "catalog %s is not a JSON object" % path
@@ -234,6 +236,10 @@ def main() -> int:
     )
     print(checks.stdout.strip())
     if checks.returncode != 0:
+        # A child crash (for example a checker bug) writes its diagnostic to
+        # stderr and leaves stdout empty; discarding stderr hid the root cause.
+        if checks.stderr.strip():
+            print(checks.stderr.strip())
         return 1
 
     problems = []
