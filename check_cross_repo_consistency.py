@@ -16,12 +16,38 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 COMMON = Path(__file__).resolve().parent
 ROOT = COMMON.parent
 CATALOG = COMMON / "agent_common" / "model_catalog.json"
-CATALOGUE = {m["id"]: m for m in json.loads(CATALOG.read_text(encoding="utf-8"))["models"]}
+
+
+def _read_catalogue(path: Optional[Path] = None) -> tuple:
+    """The catalog by model id, or ``({}, reason)`` for a malformed document.
+
+    Loading this at module import used to raise before ``main()`` could report
+    the catalog corruption the script exists to catch.
+    """
+    path = CATALOG if path is None else path
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {}, "cannot read catalog %s: %s" % (path, exc)
+    if not isinstance(document, dict):
+        return {}, "catalog %s is not a JSON object" % path
+    models = document.get("models")
+    if not isinstance(models, list):
+        return {}, "catalog %s has no models list" % path
+    catalogue = {}
+    for entry in models:
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+            return {}, "catalog %s has an invalid model entry" % path
+        catalogue[entry["id"]] = entry
+    return catalogue, ""
+
+
+CATALOGUE, _CATALOGUE_ERROR = _read_catalogue()
 
 GDP = ROOT / "generic-debug-pipeline"
 PRE = ROOT / "paper-refine-eval"
@@ -183,9 +209,11 @@ def probe(label: str, repo: Path, code: str) -> Optional[Dict[str, Any]]:
     return observed
 
 
-def expected_fields(model_id: str) -> set:
+def expected_fields(
+    model_id: str, catalogue: Optional[Mapping[str, Any]] = None
+) -> set:
     """Every fact the catalog records for one model (all are required)."""
-    entry = CATALOGUE[model_id]
+    entry = (CATALOGUE if catalogue is None else catalogue)[model_id]
     fields = {"context_window", "max_tokens", "chat_max_tokens"}
     if entry.get("base_url"):
         fields.add("base_url")
@@ -195,6 +223,10 @@ def expected_fields(model_id: str) -> set:
 
 
 def main() -> int:
+    catalogue, error = _read_catalogue()
+    if error:
+        print("FAIL %s" % error)
+        return 1
     checks = subprocess.run(
         [sys.executable, str(COMMON / "check_model_catalog.py")],
         capture_output=True,
@@ -216,17 +248,17 @@ def main() -> int:
             # observation that happens to be consistent.
             problems.append("%s probe failed" % label)
             continue
-        for model_id in sorted(set(CATALOGUE) - set(observed)):
+        for model_id in sorted(set(catalogue) - set(observed)):
             problems.append("%s: missing model %s" % (label, model_id))
-        for model_id in sorted(set(observed) - set(CATALOGUE)):
+        for model_id in sorted(set(observed) - set(catalogue)):
             problems.append("%s: unexpected model %s" % (label, model_id))
-        for model_id in sorted(set(observed) & set(CATALOGUE)):
-            fields = expected_fields(model_id)
+        for model_id in sorted(set(observed) & set(catalogue)):
+            fields = expected_fields(model_id, catalogue)
             for field in sorted(fields - set(observed[model_id])):
                 problems.append("%s: %s is missing %s" % (label, model_id, field))
             for field in sorted(fields & set(observed[model_id])):
                 value = observed[model_id][field]
-                expected = CATALOGUE[model_id].get(field)
+                expected = catalogue[model_id].get(field)
                 if expected != value:
                     problems.append(
                         "%s: %s.%s is %r, catalog says %r"

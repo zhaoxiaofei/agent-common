@@ -20,6 +20,7 @@ import hashlib
 import json
 import sys
 from pathlib import Path
+from typing import Mapping
 
 COMMON = Path(__file__).resolve().parent
 ROOT = COMMON.parent
@@ -68,7 +69,14 @@ def main() -> int:
             % (CANONICAL_MODULE, type(exc).__name__, exc)
         )
 
-    document = json.loads(CANONICAL_JSON.read_text(encoding="utf-8"))
+    try:
+        document = json.loads(CANONICAL_JSON.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print("FAIL cannot read canonical policy %s: %s" % (CANONICAL_JSON, exc))
+        return 1
+    if not isinstance(document, dict):
+        print("FAIL canonical policy is not a JSON object")
+        return 1
     # The checker must not accept a policy that load_policy would reject and
     # silently replace with the defaults.  Import here, after the syntax check,
     # so an invalid canonical module is reported instead of crashing the checker
@@ -81,12 +89,22 @@ def main() -> int:
             % (type(exc).__name__, exc)
         )
         _llm_retry = None
-    if _llm_retry is not None:
-        try:
-            _llm_retry._merge_policy(document)
-        except (TypeError, ValueError, OverflowError) as exc:
-            problems.append("the runtime rejects this policy: %s" % exc)
-    retry = document.get("retry") or {}
+    if _llm_retry is None:
+        for problem in problems:
+            print("FAIL %s" % problem)
+        return 1
+    try:
+        _llm_retry._merge_policy(document)
+    except (TypeError, ValueError, OverflowError) as exc:
+        problems.append("the runtime rejects this policy: %s" % exc)
+        # The derived schedule below reads the same unvalidated values; a
+        # rejected policy must be reported, not crash float()/int().
+        for problem in problems:
+            print("FAIL %s" % problem)
+        return 1
+    retry = document.get("retry")
+    if not isinstance(retry, Mapping):
+        retry = {}
     expected = [10, 20, 40, 80, 160, 320, 640, 1280, 2560, 3600]
     initial = float(retry.get("initial_delay_seconds", 0))
     multiplier = float(retry.get("multiplier", 0))
@@ -103,12 +121,16 @@ def main() -> int:
     if 429 not in (retry.get("retryable_http_statuses") or []):
         problems.append("HTTP 429 is not retryable")
 
-    dots = document.get("dots") or {}
+    dots = document.get("dots")
+    if not isinstance(dots, Mapping):
+        dots = {}
     if dots.get("regular_api_key_env") == dots.get("compaction_api_key_env"):
         problems.append("regular and compaction Dots keys are the same variable")
     if not dots.get("compaction_provider"):
         problems.append("no dedicated compaction provider is declared")
-    compaction = document.get("compaction") or {}
+    compaction = document.get("compaction")
+    if not isinstance(compaction, Mapping):
+        compaction = {}
     if int(compaction.get("summarization_max_tokens") or 0) <= 0:
         problems.append("summarization_max_tokens is not a positive bound")
 

@@ -33,6 +33,15 @@ class BudgetTests(unittest.TestCase):
     def test_a_prompt_that_cannot_fit_has_no_budget(self):
         self.assertEqual(completion_budget(1_000, 4_096, 10_000), 0)
 
+    def test_an_unreachable_minimum_does_not_overflow_room_or_cap(self):
+        # 3000-window, 100-char prompt -> 922 tokens of room; the 1000 cap is
+        # the smaller limit.  A 5000 minimum cannot override either.
+        self.assertEqual(completion_budget(3_000, 1_000, 100, minimum=5_000), 922)
+        self.assertEqual(completion_budget(0, 100, 10, minimum=200), 100)
+        self.assertEqual(
+            completion_budget(3_000, 1_000, 100, minimum=500), 922
+        )
+
     def test_the_reserve_default_is_exposed(self):
         self.assertEqual(CONTEXT_RESERVE_TOKENS, 2048)
 

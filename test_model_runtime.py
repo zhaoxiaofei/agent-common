@@ -380,6 +380,104 @@ class PrepProxyTests(unittest.TestCase):
             _stop_server(target)
             _stop_server(redirector)
 
+    def test_a_v1_path_with_a_query_is_not_prefixed_twice(self):
+        class Recorder(BaseHTTPRequestHandler):
+            def log_message(self, *args):  # noqa: A003 - stdlib name
+                return
+
+            def do_GET(self):  # noqa: N802 - stdlib name
+                self.server.path = self.path
+                body = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        upstream = _start_server(Recorder)
+        upstream.path = None
+        base, error = model_runtime.start_prep_proxy(
+            "http://127.0.0.1:%d/v1" % upstream.server_address[1], {}
+        )
+        self.assertEqual(error, "")
+        try:
+            host, port = _host_port(base)
+            connection = http.client.HTTPConnection(host, port, timeout=5)
+            connection.request("GET", "/v1?x=1")
+            response = connection.getresponse()
+            response.read()
+            connection.close()
+            self.assertEqual(upstream.path, "/v1?x=1")
+        finally:
+            model_runtime.stop_prep_proxy(base)
+            _stop_server(upstream)
+
+    def test_upstream_error_headers_are_forwarded(self):
+        class RateLimited(BaseHTTPRequestHandler):
+            def log_message(self, *args):  # noqa: A003 - stdlib name
+                return
+
+            def do_POST(self):  # noqa: N802 - stdlib name
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                body = b"{}"
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Retry-After", "7")
+                self.send_header("X-RateLimit-Remaining", "0")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        upstream = _start_server(RateLimited)
+        base, error = model_runtime.start_prep_proxy(
+            "http://127.0.0.1:%d/v1" % upstream.server_address[1], {}
+        )
+        self.assertEqual(error, "")
+        try:
+            request = urllib.request.Request(
+                base + "/v1/chat/completions", data=b"{}", method="POST"
+            )
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request, timeout=5)
+            self.assertEqual(caught.exception.code, 429)
+            self.assertEqual(caught.exception.headers.get("Retry-After"), "7")
+            self.assertEqual(
+                caught.exception.headers.get("X-RateLimit-Remaining"), "0"
+            )
+        finally:
+            model_runtime.stop_prep_proxy(base)
+            _stop_server(upstream)
+
+    def test_a_truncated_upstream_error_body_becomes_a_structured_502(self):
+        class TruncatedError(BaseHTTPRequestHandler):
+            def log_message(self, *args):  # noqa: A003 - stdlib name
+                return
+
+            def do_POST(self):  # noqa: N802 - stdlib name
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(500)
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                self.wfile.write(b"x")
+                self.wfile.flush()
+                self.close_connection = True
+
+        upstream = _start_server(TruncatedError)
+        base, error = model_runtime.start_prep_proxy(
+            "http://127.0.0.1:%d/v1" % upstream.server_address[1], {}
+        )
+        self.assertEqual(error, "")
+        try:
+            request = urllib.request.Request(
+                base + "/v1/chat/completions", data=b"{}", method="POST"
+            )
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request, timeout=5)
+            self.assertEqual(caught.exception.code, 502)
+            self.assertIn(b"could not read", caught.exception.read())
+        finally:
+            model_runtime.stop_prep_proxy(base)
+            _stop_server(upstream)
+
     def test_a_chunked_post_is_rejected_instead_of_forwarded_without_its_body(self):
         upstream = _start_server(_ChunkRecorder)
         upstream.called = False
@@ -815,6 +913,23 @@ class SelectionReprRedactionTests(unittest.TestCase):
         self.assertNotIn("SECRET", text)
         self.assertIn("https://host/v1", text)
 
+    def test_a_prep_credential_is_redacted_in_the_repr(self):
+        selection = model_runtime.AgentSelection(
+            harness="dsh",
+            model="qwen38-27b",
+            prep_json={"api_key": "sk-live", "max_tokens": 5},
+        )
+        text = repr(selection)
+        self.assertNotIn("sk-live", text)
+        self.assertIn("[REDACTED]", text)
+        self.assertIn("max_tokens", text)
+
+    def test_endpoint_base_strips_the_separator_slash(self):
+        self.assertEqual(
+            model_runtime.endpoint_base("https://host/v1//chat/completions"),
+            "https://host/v1",
+        )
+
 
 class EndpointResolutionTests(unittest.TestCase):
     def test_a_named_model_returns_the_documented_empty_resolution(self):
@@ -1010,6 +1125,8 @@ class PatchTextOverrideTests(unittest.TestCase):
             {"context_window_override": 0},
             {"max_tokens_override": 0},
             {"context_window_override": 100, "max_tokens_override": 100},
+            {"context_window_override": float("inf")},
+            {"context_window_override": float("nan")},
         ):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(model_runtime.ConfigError):
@@ -1045,6 +1162,49 @@ class ClaudeEffortTests(unittest.TestCase):
         ):
             env = model_runtime.claude_environment(self.selection("qwen38-27b"))
         self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", env)
+
+    def test_native_gpt_claude_and_default_use_claudes_vocabulary(self):
+        cases = (
+            ("default", "dsh"),
+            ("claude-opus", "claude-code"),
+            ("gpt-sol", "dsh"),
+        )
+        for model, harness in cases:
+            for requested, expected in (
+                ("minimal", "low"),
+                ("xhigh", "max"),
+                ("high", "high"),
+            ):
+                with self.subTest(model=model, requested=requested):
+                    with mock.patch.dict(
+                        os.environ,
+                        {"PAPER_AGENT_REASONING_EFFORT": requested},
+                        clear=True,
+                    ):
+                        selection = model_runtime.resolve_agent_selection(
+                            harness=harness, model=model
+                        )
+                        env = model_runtime.claude_environment(selection)
+                    self.assertEqual(env["CLAUDE_CODE_EFFORT_LEVEL"], expected)
+
+    def test_off_omits_the_level_on_every_claude_code_route(self):
+        for model, harness in (
+            ("default", "dsh"),
+            ("claude-opus", "claude-code"),
+            ("gpt-sol", "dsh"),
+            ("deepseek-flash", "claude-code"),
+        ):
+            with self.subTest(model=model):
+                with mock.patch.dict(
+                    os.environ,
+                    {"PAPER_AGENT_REASONING_EFFORT": "off"},
+                    clear=True,
+                ):
+                    selection = model_runtime.resolve_agent_selection(
+                        harness=harness, model=model
+                    )
+                    env = model_runtime.claude_environment(selection)
+                self.assertNotIn("CLAUDE_CODE_EFFORT_LEVEL", env)
 
 
 class PrepProxyHeaderTests(unittest.TestCase):

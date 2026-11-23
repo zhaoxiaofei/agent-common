@@ -50,6 +50,17 @@ HOP_BY_HOP_HEADERS = frozenset(
 PROXY_RESPONSE_HEADERS = frozenset({"server", "date", "content-length"})
 
 
+def _connection_tokens(values: Iterable[Any]) -> set:
+    """Header names the Connection header declares hop-by-hop (RFC 7230 6.1)."""
+    tokens = set()
+    for value in values:
+        for token in str(value or "").split(","):
+            name = token.strip().lower()
+            if name:
+                tokens.add(name)
+    return tokens
+
+
 def _request_is_chunked(headers: Mapping[str, str]) -> bool:
     """Whether the client used unsupported chunked framing."""
     transfer = str(headers.get("Transfer-Encoding") or "").lower()
@@ -88,6 +99,16 @@ def _forwardable_request_headers(
     """Copy request headers, dropping the hop-by-hop and framing ones."""
     skip = set(HOP_BY_HOP_HEADERS) | {"host", "content-length"}
     skip.update(str(name).lower() for name in extra_skip)
+    # RFC 7230 also makes every header named by Connection hop-by-hop.  The
+    # fixed set alone forwarded ``Connection: X-Secret`` together with
+    # ``X-Secret: SECRET`` to the upstream.
+    skip.update(
+        _connection_tokens(
+            value
+            for name, value in headers.items()
+            if name.lower() == "connection"
+        )
+    )
     return {
         name: value
         for name, value in headers.items()
@@ -99,11 +120,17 @@ def _forwardable_response_headers(
     headers: Iterable[Tuple[str, str]]
 ) -> List[Tuple[str, str]]:
     """Upstream response headers safe to re-emit from the loopback server."""
+    items = list(headers)
+    skip = set(HOP_BY_HOP_HEADERS) | set(PROXY_RESPONSE_HEADERS)
+    skip.update(
+        _connection_tokens(
+            value for name, value in items if name.lower() == "connection"
+        )
+    )
     return [
         (name, value)
-        for name, value in headers
-        if name.lower() not in HOP_BY_HOP_HEADERS
-        and name.lower() not in PROXY_RESPONSE_HEADERS
+        for name, value in items
+        if name.lower() not in skip
     ]
 
 
@@ -569,6 +596,20 @@ class _RetryProxyHandler(http.server.BaseHTTPRequestHandler):
                 time.sleep(delay)
                 continue
             try:
+                if 300 <= status < 400:
+                    # Relay nothing: a client that follows the redirect
+                    # re-sends the Authorization header to the Location host.
+                    # The prep proxy refuses redirects for the same reason.
+                    proxy.log(
+                        "%s: upstream %s refused redirect HTTP %d"
+                        % (proxy.name, method, status)
+                    )
+                    self._send_error(
+                        502,
+                        "retry proxy refused a redirect (HTTP %d); "
+                        "credentials are not forwarded to another host" % status,
+                    )
+                    return
                 if status < 400 or not schedule.status_is_retryable(status):
                     try:
                         self._relay(status, headers, response)
@@ -644,8 +685,22 @@ class _RetryProxyHandler(http.server.BaseHTTPRequestHandler):
         headers: Iterable[Tuple[str, str]],
         response: http.client.HTTPResponse,
     ) -> None:
+        header_items = list(headers)
+        declared_length = next(
+            (
+                value
+                for name, value in header_items
+                if name.lower() == "content-length"
+            ),
+            None,
+        )
         self.send_response(status)
-        self._copy_headers(headers)
+        self._copy_headers(header_items)
+        if declared_length is not None:
+            # ``_forwardable_response_headers`` drops the framing header;
+            # re-emit the upstream value so a truncated success body is a
+            # client-visible IncompleteRead instead of a silent short 200.
+            self.send_header("Content-Length", declared_length)
         self.send_header("Connection", "close")
         self.end_headers()
         _relay_response_body(

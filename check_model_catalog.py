@@ -70,23 +70,40 @@ def main() -> int:
         print("missing canonical catalog: %s" % CANONICAL)
         return 1
     expected = digest(CANONICAL)
-    document = json.loads(CANONICAL.read_text(encoding="utf-8"))
+    try:
+        document = json.loads(CANONICAL.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print("FAIL cannot read canonical catalog %s: %s" % (CANONICAL, exc))
+        return 1
+    if not isinstance(document, dict):
+        print("FAIL canonical catalog is not a JSON object")
+        return 1
+    models = document.get("models", [])
+    if not isinstance(models, list):
+        print("FAIL canonical catalog models is not a list")
+        return 1
     if document.get("schema_version") != 1:
         problems.append("unsupported schema_version %r" % document.get("schema_version"))
     seen = set()
-    for entry in document.get("models", []):
+    for entry in models:
+        if not isinstance(entry, dict):
+            problems.append("catalog entry is not an object: %r" % (entry,))
+            continue
         model_id = entry.get("id")
-        if not model_id or model_id in seen:
-            problems.append("missing or duplicate model id %r" % (model_id,))
+        if not isinstance(model_id, str) or not model_id:
+            problems.append("bad model id %r" % (model_id,))
+            continue
+        if model_id in seen:
+            problems.append("duplicate model id %r" % (model_id,))
             continue
         seen.add(model_id)
         context = entry.get("context_window")
         output = entry.get("max_tokens")
-        if not isinstance(context, int) or context <= 0:
+        if type(context) is not int or context <= 0:
             problems.append("%s: bad context_window %r" % (model_id, context))
-        if not isinstance(output, int) or output <= 0:
+        if type(output) is not int or output <= 0:
             problems.append("%s: bad max_tokens %r" % (model_id, output))
-        elif isinstance(context, int) and output >= context:
+        elif type(context) is int and output >= context:
             problems.append(
                 "%s: max_tokens %d does not fit context_window %d"
                 % (model_id, output, context)
@@ -101,14 +118,14 @@ def main() -> int:
         if not entry.get("verified_at"):
             problems.append("%s: missing verified_at" % model_id)
         chat = entry.get("chat_max_tokens")
-        if not isinstance(chat, int) or chat <= 0:
+        if type(chat) is not int or chat <= 0:
             problems.append("%s: bad chat_max_tokens %r" % (model_id, chat))
-        elif isinstance(context, int) and chat >= context:
+        elif type(context) is int and chat >= context:
             problems.append(
                 "%s: chat_max_tokens %d does not fit context_window %d"
                 % (model_id, chat, context)
             )
-        elif isinstance(output, int) and chat < output:
+        elif type(output) is int and chat < output:
             problems.append(
                 "%s: chat_max_tokens %d is below max_tokens %d"
                 % (model_id, chat, output)

@@ -49,6 +49,9 @@ def completion_budget(
 
     ``context_window == 0`` means the caller supplied no window (older
     regression fixtures do); in that case the output cap is the only limit.
+    ``minimum`` is kept for callers that ask for a floor, but a floor larger
+    than the usable limit cannot be met: the result is always capped at
+    ``min(output_cap, room)`` so it never overflows the context or the cap.
 
     Example:
         With a 10,000-token window, a 16,000-token cap and a 1,000-character
@@ -61,11 +64,19 @@ def completion_budget(
     context = int(context_window or 0)
     cap = int(output_cap or 0)
     if not context:
-        return max(minimum, cap)
-    room = context - estimated_prompt_tokens(prompt_chars) - int(reserve_tokens)
-    if room <= 0:
+        limit = cap
+    else:
+        room = (
+            context
+            - estimated_prompt_tokens(prompt_chars)
+            - int(reserve_tokens)
+        )
+        if room <= 0:
+            return 0
+        limit = min(cap, room)
+    if limit <= 0:
         return 0
-    return max(minimum, min(cap, room))
+    return limit
 
 
 def message_text(content: object) -> str:

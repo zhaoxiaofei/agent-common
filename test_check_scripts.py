@@ -6,6 +6,8 @@ import contextlib
 import io
 import json
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -71,6 +73,59 @@ class CrossRepoProbeTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("OK gdp, paper-refine-eval and paper-refine", output)
 
+    def test_a_malformed_catalog_is_reported_by_main_not_at_import(self):
+        for text, message in (
+            ("[]", "not a JSON object"),
+            ("{", "cannot read catalog"),
+        ):
+            with self.subTest(text=text):
+                directory = tempfile.TemporaryDirectory()
+                self.addCleanup(directory.cleanup)
+                path = Path(directory.name) / "model_catalog.json"
+                path.write_text(text, encoding="utf-8")
+                output = io.StringIO()
+                # Isolate main() from the sibling-checkout checks: in a
+                # standalone checkout their missing copies also print FAIL,
+                # which made the old assertion pass on the unfixed checker.
+                completed = mock.Mock(returncode=0, stdout="OK", stderr="")
+                with mock.patch.object(
+                    check_cross_repo_consistency, "CATALOG", path
+                ), mock.patch.object(
+                    check_cross_repo_consistency.subprocess,
+                    "run",
+                    return_value=completed,
+                ):
+                    with contextlib.redirect_stdout(output):
+                        try:
+                            code = check_cross_repo_consistency.main()
+                        except Exception as exc:  # pragma: no cover - the bug
+                            self.fail(
+                                "checker crashed: %s: %s"
+                                % (type(exc).__name__, exc)
+                            )
+                self.assertEqual(code, 1)
+                self.assertIn(message, output.getvalue())
+
+    def test_importing_a_malformed_catalog_does_not_crash(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / "agent_common").mkdir()
+        (root / "agent_common" / "model_catalog.json").write_text(
+            "[]", encoding="utf-8"
+        )
+        shutil.copy(
+            Path(check_cross_repo_consistency.__file__),
+            root / "check_cross_repo_consistency.py",
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", "import check_cross_repo_consistency"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
 
 class ModelCatalogCheckTests(unittest.TestCase):
     def _document(self):
@@ -116,6 +171,61 @@ class ModelCatalogCheckTests(unittest.TestCase):
         code, output = self._run(self._document())
         self.assertEqual(code, 0)
         self.assertIn("OK 7 models", output)
+
+    def test_a_non_object_catalog_fails_instead_of_crashing(self):
+        for document in ([], 3, "text"):
+            with self.subTest(document=document):
+                code, output = self._run(document)
+                self.assertEqual(code, 1)
+                self.assertIn("FAIL", output)
+                self.assertIn("not a JSON object", output)
+
+    def test_invalid_catalog_json_fails_instead_of_crashing(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "model_catalog.json"
+        path.write_text("{", encoding="utf-8")
+        output = io.StringIO()
+        with mock.patch.object(
+            check_model_catalog, "CANONICAL", path
+        ), mock.patch.object(check_model_catalog, "COPIES", []):
+            with contextlib.redirect_stdout(output):
+                code = check_model_catalog.main()
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL cannot read canonical catalog", output.getvalue())
+
+    def test_boolean_capacities_are_rejected(self):
+        document = self._document()
+        for entry in document["models"]:
+            if entry["id"] == "deepseek-flash":
+                entry["context_window"] = 2
+                entry["max_tokens"] = True
+                entry["chat_max_tokens"] = True
+        code, output = self._run(document)
+        self.assertEqual(code, 1)
+        self.assertIn("bad max_tokens True", output)
+        self.assertIn("bad chat_max_tokens True", output)
+
+    def test_a_malformed_entry_is_reported_instead_of_crashing(self):
+        document = self._document()
+        entries = (
+            None,
+            "x",
+            {"id": ["x"]},
+            {"id": {"x": 1}},
+            {"id": 1},
+            {"id": ""},
+        )
+        for entry in entries:
+            with self.subTest(entry=entry):
+                document["models"] = [entry]
+                code, output = self._run(document)
+                self.assertEqual(code, 1)
+                self.assertNotIn("Traceback", output)
+                if isinstance(entry, dict):
+                    self.assertIn("bad model id", output)
+                else:
+                    self.assertIn("not an object", output)
 
 
 class LlmPolicyCheckTests(unittest.TestCase):
@@ -190,6 +300,46 @@ class LlmPolicyRuntimeValidationTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("runtime rejects this policy", output)
 
+    def test_a_rejected_value_does_not_crash_the_derived_schedule(self):
+        def mutate(document):
+            document["retry"]["initial_delay_seconds"] = "abc"
+
+        root, canonical = self._checkout(mutate_policy=mutate)
+        code, output = self._run(root, canonical)
+        self.assertEqual(code, 1)
+        self.assertIn("runtime rejects this policy", output)
+        self.assertNotIn("Traceback", output)
+
+
+class LlmPolicyDocumentShapeTests(unittest.TestCase):
+    def _run_text(self, text):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "llm_policy.json"
+        path.write_text(text, encoding="utf-8")
+        output = io.StringIO()
+        with mock.patch.object(
+            check_llm_policy, "CANONICAL_JSON", path
+        ), mock.patch.object(check_llm_policy, "COPIES", ()):
+            with contextlib.redirect_stdout(output):
+                try:
+                    code = check_llm_policy.main()
+                except Exception as exc:  # pragma: no cover - the bug itself
+                    self.fail("checker crashed: %s: %s" % (type(exc).__name__, exc))
+        return code, output.getvalue()
+
+    def test_a_non_object_policy_fails_instead_of_crashing(self):
+        for text in ("[]", "3"):
+            with self.subTest(text=text):
+                code, output = self._run_text(text)
+                self.assertEqual(code, 1)
+                self.assertIn("not a JSON object", output)
+
+    def test_invalid_policy_json_fails_instead_of_crashing(self):
+        code, output = self._run_text("{")
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL cannot read canonical policy", output)
+
 
 class SharedPackageCheckTests(unittest.TestCase):
     def _tree(self):
@@ -242,6 +392,25 @@ class SharedPackageCheckTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("missing copy", output)
         self.assertIn("model_runtime.py", output)
+
+
+class PolicyDocumentationTests(unittest.TestCase):
+    def test_the_description_does_not_claim_generated_per_checkout_copies(self):
+        document = json.loads(
+            check_llm_policy.CANONICAL_JSON.read_text(encoding="utf-8")
+        )
+        description = document["description"]
+        self.assertNotIn("copies beside each checkout are generated", description)
+        self.assertIn("submodule", description)
+        script = (
+            check_llm_policy.CANONICAL_JSON.parent.parent
+            / "sync_llm_policy.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'git -C "$checkout" submodule update --init --recursive agent-common',
+            script,
+        )
+        self.assertNotIn("cp ", script)
 
 
 if __name__ == "__main__":

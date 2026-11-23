@@ -19,6 +19,8 @@ from agent_common.llm_retry import (
     DEFAULT_POLICY,
     RetryProxy,
     RetrySchedule,
+    _forwardable_request_headers,
+    _forwardable_response_headers,
     default_log,
     load_policy,
 )
@@ -129,6 +131,34 @@ class ProxyTargetTests(unittest.TestCase):
             with self.subTest(url=url):
                 with self.assertRaises(ValueError):
                     RetryProxy(url)
+
+
+class HopByHopHeaderTests(unittest.TestCase):
+    def test_connection_named_request_headers_are_not_forwarded(self):
+        forwarded = _forwardable_request_headers(
+            {
+                "Connection": "X-Secret, keep-alive",
+                "X-Secret": "SECRET",
+                "Authorization": "Bearer live",
+                "Content-Type": "application/json",
+            }
+        )
+        self.assertNotIn("X-Secret", forwarded)
+        self.assertNotIn("Connection", forwarded)
+        self.assertEqual(forwarded["Authorization"], "Bearer live")
+        self.assertEqual(forwarded["Content-Type"], "application/json")
+
+    def test_connection_named_response_headers_are_not_relayed(self):
+        forwarded = _forwardable_response_headers(
+            [
+                ("Connection", "X-Secret"),
+                ("X-Secret", "SECRET"),
+                ("Content-Type", "application/json"),
+            ]
+        )
+        self.assertNotIn(("X-Secret", "SECRET"), forwarded)
+        self.assertNotIn(("Connection", "X-Secret"), forwarded)
+        self.assertIn(("Content-Type", "application/json"), forwarded)
 
 
 class OpenFailureTests(unittest.TestCase):
@@ -324,6 +354,98 @@ class ErrorBodyTimeoutTests(unittest.TestCase):
         self.assertTrue(
             any("body read failed" in line for line in self.logs), self.logs
         )
+
+
+class RedirectRefusalTests(unittest.TestCase):
+    def test_a_redirect_is_refused_and_location_is_not_relayed(self):
+        class Target(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):  # noqa: A003 - stdlib name
+                return
+
+            def do_GET(self):  # noqa: N802 - stdlib name
+                self.server.hits = getattr(self.server, "hits", 0) + 1
+                body = b"landed"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        class Redirector(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):  # noqa: A003 - stdlib name
+                return
+
+            def do_GET(self):  # noqa: N802 - stdlib name
+                self.send_response(302)
+                self.send_header(
+                    "Location",
+                    "http://127.0.0.1:%d/landed" % self.server.target_port,
+                )
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        target = ThreadingHTTPServer(("127.0.0.1", 0), Target)
+        target.hits = 0
+        redirector = ThreadingHTTPServer(("127.0.0.1", 0), Redirector)
+        redirector.target_port = target.server_address[1]
+        for server in (target, redirector):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        proxy = RetryProxy(
+            "http://127.0.0.1:%d/v1" % redirector.server_address[1]
+        )
+        base = proxy.start()
+        try:
+            request = urllib.request.Request(
+                base + "/v1/chat",
+                headers={"Authorization": "Bearer SECRET"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request, timeout=5)
+            self.assertEqual(caught.exception.code, 502)
+            self.assertIsNone(caught.exception.headers.get("Location"))
+            self.assertEqual(target.hits, 0)
+        finally:
+            proxy.stop()
+            for server in (target, redirector):
+                server.shutdown()
+                server.server_close()
+
+
+class TruncatedSuccessBodyTests(unittest.TestCase):
+    def test_the_upstream_content_length_is_preserved(self):
+        class Truncated(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):  # noqa: A003 - stdlib name
+                return
+
+            def do_POST(self):  # noqa: N802 - stdlib name
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                self.wfile.write(b"x")
+                self.wfile.flush()
+                self.close_connection = True
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), Truncated)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        proxy = RetryProxy("http://127.0.0.1:%d/v1" % upstream.server_address[1])
+        base = proxy.start()
+        try:
+            parsed = urllib.parse.urlsplit(base)
+            connection = http.client.HTTPConnection(
+                parsed.hostname, parsed.port, timeout=5
+            )
+            connection.request("POST", "/v1/chat", body=b"{}")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.getheader("Content-Length"), "100")
+            with self.assertRaises(http.client.IncompleteRead):
+                response.read()
+            connection.close()
+        finally:
+            proxy.stop()
+            upstream.shutdown()
+            upstream.server_close()
 
 
 class MalformedPolicyFallbackTests(unittest.TestCase):
