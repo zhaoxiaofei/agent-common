@@ -158,6 +158,7 @@ DEFAULT_POLICY: Dict[str, Any] = {
         "compaction_retries": 2,
         "max_overflow_retries": 2,
         "compaction_stream_idle_timeout_ms": 4200000,
+        "summarization_max_tokens": 16384,
     },
 }
 
