@@ -47,16 +47,31 @@ def digest(path: Path) -> str:
 
 def main() -> int:
     problems = []
-    canonical = package_files(CANONICAL_DIR)
+    try:
+        canonical = package_files(CANONICAL_DIR)
+    except OSError as exc:
+        print("FAIL cannot enumerate canonical package files: %s" % exc)
+        return 1
     if not canonical:
         print("missing canonical package files: %s" % CANONICAL_DIR)
         return 1
     for directory in COPIES:
-        copy = package_files(directory)
+        try:
+            copy = package_files(directory)
+        except OSError as exc:
+            problems.append("cannot enumerate copy %s: %s" % (directory, exc))
+            continue
         for name in sorted(canonical):
             if name not in copy:
                 problems.append("missing copy: %s" % (directory / name))
-            elif digest(copy[name]) != digest(canonical[name]):
+                continue
+            try:
+                copy_digest = digest(copy[name])
+                canonical_digest = digest(canonical[name])
+            except OSError as exc:
+                problems.append("cannot read %s: %s" % (directory / name, exc))
+                continue
+            if copy_digest != canonical_digest:
                 problems.append("copy differs from canonical: %s" % (directory / name))
         for name in sorted(set(copy) - set(canonical)):
             problems.append("unexpected file in copy: %s" % (directory / name))

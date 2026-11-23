@@ -21,7 +21,18 @@ from typing import Any, Dict, Optional
 COMMON = Path(__file__).resolve().parent
 ROOT = COMMON.parent
 CATALOG = COMMON / "agent_common" / "model_catalog.json"
-CATALOGUE = {m["id"]: m for m in json.loads(CATALOG.read_text(encoding="utf-8"))["models"]}
+# Loading at import time made a malformed catalog crash the whole check before
+# main() could report the failure it exists to find.  Keep the import alive and
+# carry the reason into main().
+_CATALOGUE_ERROR = ""
+try:
+    CATALOGUE = {
+        m["id"]: m
+        for m in json.loads(CATALOG.read_text(encoding="utf-8"))["models"]
+    }
+except (OSError, TypeError, ValueError, KeyError, RecursionError) as exc:
+    CATALOGUE = {}
+    _CATALOGUE_ERROR = "%s: %s" % (type(exc).__name__, exc)
 
 GDP = ROOT / "generic-debug-pipeline"
 PRE = ROOT / "paper-refine-eval"
@@ -195,6 +206,9 @@ def expected_fields(model_id: str) -> set:
 
 
 def main() -> int:
+    if _CATALOGUE_ERROR:
+        print("FAIL cannot read canonical catalog: %s" % _CATALOGUE_ERROR)
+        return 1
     checks = subprocess.run(
         [sys.executable, str(COMMON / "check_model_catalog.py")],
         capture_output=True,
@@ -202,6 +216,9 @@ def main() -> int:
     )
     print(checks.stdout.strip())
     if checks.returncode != 0:
+        # The child checker's traceback/FAIL reason is the only diagnostic for
+        # the failure; discarding stderr hid it from CI.
+        print(checks.stderr.strip())
         return 1
 
     problems = []

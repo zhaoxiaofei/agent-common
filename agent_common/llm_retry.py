@@ -50,6 +50,17 @@ HOP_BY_HOP_HEADERS = frozenset(
 PROXY_RESPONSE_HEADERS = frozenset({"server", "date", "content-length"})
 
 
+def _redacted_url(text: Any) -> str:
+    """A URL safe to put in an error message: no userinfo, query or fragment."""
+    value = str(text or "")
+    safe = value.split("#", 1)[0].split("?", 1)[0]
+    if "://" in safe:
+        scheme, _, rest = safe.partition("://")
+        authority, separator, tail = rest.partition("/")
+        return scheme + "://" + authority.rsplit("@", 1)[-1] + separator + tail
+    return safe.rsplit("@", 1)[-1]
+
+
 def _request_is_chunked(headers: Mapping[str, str]) -> bool:
     """Whether the client used unsupported chunked framing."""
     transfer = str(headers.get("Transfer-Encoding") or "").lower()
@@ -569,6 +580,25 @@ class _RetryProxyHandler(http.server.BaseHTTPRequestHandler):
                 time.sleep(delay)
                 continue
             try:
+                if 300 <= status < 400:
+                    # urllib's default redirect handler copies Authorization
+                    # to the Location host.  A provider/gateway must not be
+                    # able to move the model request (and its key) elsewhere.
+                    proxy.log(
+                        "%s: upstream %s returned a redirect (HTTP %d); "
+                        "refusing to forward it" % (proxy.name, method, status)
+                    )
+                    self._send_error(
+                        502,
+                        "upstream redirect (HTTP %d) is not forwarded; "
+                        "credentials stay on this host" % status,
+                    )
+                    try:
+                        response.close()
+                        connection.close()
+                    except Exception:
+                        pass
+                    return
                 if status < 400 or not schedule.status_is_retryable(status):
                     try:
                         self._relay(status, headers, response)
@@ -644,13 +674,18 @@ class _RetryProxyHandler(http.server.BaseHTTPRequestHandler):
         headers: Iterable[Tuple[str, str]],
         response: http.client.HTTPResponse,
     ) -> None:
-        self.send_response(status)
-        self._copy_headers(headers)
-        self.send_header("Connection", "close")
-        self.end_headers()
-        _relay_response_body(
-            response, lambda chunk: (self.wfile.write(chunk), self.wfile.flush())
-        )
+        # Buffer before writing the response line.  Streaming a body whose
+        # upstream Content-Length was stripped let a truncated completion reach
+        # the caller as a normal 200; an IncompleteRead must become a typed
+        # error instead, and only a known-complete body may be sent.
+        try:
+            body = response.read()
+        except (OSError, http.client.HTTPException) as exc:
+            self._send_error(
+                502, "upstream response body was truncated: %s" % (exc,)
+            )
+            return
+        self._send(status, headers, body)
 
     def _copy_headers(self, headers: Iterable[Tuple[str, str]]) -> None:
         # send_response() already wrote Server/Date/Content-Length; copying
@@ -694,7 +729,10 @@ class RetryProxy:
         raw_base = str(upstream_base)
         parsed = urllib.parse.urlsplit(raw_base)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            raise ValueError("upstream_base must be an http(s) URL: %r" % upstream_base)
+            raise ValueError(
+                "upstream_base must be an http(s) URL: %r"
+                % _redacted_url(upstream_base)
+            )
         if parsed.username is not None or parsed.password is not None:
             # The proxy never authenticates the upstream hop with URL userinfo;
             # accepting it and dropping it silently lost a caller's credential.
@@ -756,6 +794,13 @@ class RetryProxy:
             ``/v1/chat`` and ``/v1?x=1`` stays ``/v1?x=1``.
         """
         requested = path or "/"
+        if requested.lower().startswith(("http://", "https://")):
+            # An absolute-form request target names a different origin; the
+            # proxy is pinned to one upstream, so concatenating it produced
+            # ``/v1http://...``.  Refuse it rather than forward it.
+            raise ValueError("absolute-form request targets are not supported")
+        if not requested.startswith("/"):
+            requested = "/" + requested
         # Compare only the path component: ``/v1?x=1`` is already under a
         # ``/v1`` prefix even though it does not start with ``/v1/``.
         path_only = requested.split("?", 1)[0]
@@ -768,7 +813,10 @@ class RetryProxy:
             target = self._prefix + requested
         if self._query:
             target += ("&" if "?" in target else "?") + self._query
-        return target
+        # http.client writes the request target as ASCII; a non-ASCII path
+        # raised UnicodeEncodeError and killed the handler thread.  Percent
+        # encode it (existing escapes keep their ``%`` because it is safe).
+        return urllib.parse.quote(target, safe="/?&=%:@!$'()*+,;~-._[]")
 
     def open(
         self,

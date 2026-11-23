@@ -1086,7 +1086,13 @@ class AgentSelection:
         return (
             "AgentSelection(harness=%r, model=%r, legacy=%r, model_name=%r, "
             "prep_json=%r)"
-            % (self.harness, model, self.legacy, self.model_name, self.prep_json)
+            % (
+                self.harness,
+                model,
+                self.legacy,
+                _redacted_model_name(self.model_name),
+                redact_prep_object(self.prep_json),
+            )
         )
 
     @property
@@ -1150,7 +1156,7 @@ class AgentSelection:
         return {
             "harness": self.harness,
             "model": record_model,
-            "id": self.effective_model_id(raw_model),
+            "id": _redacted_model_name(self.effective_model_id(raw_model)),
             "legacy": self.legacy,
             # A caller may put a credential in the endpoint's query string. This record is
             # written to command.json and status.json, which every agent can read, so the
@@ -1159,7 +1165,9 @@ class AgentSelection:
             "endpoint": str(record_model)
             if self.is_endpoint and record_model is not None
             else None,
-            "model_name": self.model_name if self.is_endpoint else None,
+            "model_name": _redacted_model_name(self.model_name)
+            if self.is_endpoint
+            else None,
             "api_key_set": bool(
                 self.api_key
                 or (
@@ -1297,9 +1305,17 @@ def redact_endpoint_url(url: str) -> str:
         credential and the query.
     """
     text = str(url or "").strip()
-    parsed = urllib.parse.urlsplit(text)
+    try:
+        parsed = urllib.parse.urlsplit(text)
+    except ValueError:
+        # An unparsable URL (for example an unmatched ``[``) must still be
+        # redacted; returning it verbatim was a fail-open credential leak.
+        return _safe_endpoint_text(text)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        return text
+        # A scheme-relative, non-http(s) or host-less value is not a usable
+        # endpoint, but it can carry userinfo or a credential query.  Strip it
+        # textually instead of returning the input verbatim.
+        return _safe_endpoint_text(text)
     netloc = parsed.netloc.rsplit("@", 1)[-1]
     return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
@@ -1512,9 +1528,14 @@ def endpoint_base(url: str) -> str:
         raise ConfigError(
             "--agent-model endpoint %r has an invalid port: %d" % (safe, port)
         )
-    path = parsed.path.rstrip("/")
+    path = parsed.path
+    # A duplicated slash (``/v1//chat/completions``) used to leave a trailing
+    # slash after the suffix was removed, so DSH appended ``//chat`` to it.
+    while "//" in path:
+        path = path.replace("//", "/")
+    path = path.rstrip("/")
     if path.endswith("/chat/completions"):
-        path = path[: -len("/chat/completions")]
+        path = path[: -len("/chat/completions")].rstrip("/")
     netloc = parsed.netloc.rsplit("@", 1)[-1]
     return urllib.parse.urlunsplit((parsed.scheme, netloc, path, "", ""))
 
@@ -1791,8 +1812,15 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
     def _target(self) -> str:
         base = str(self.server.target_base).rstrip("/")  # type: ignore[attr-defined]
         path = self.path or "/"
-        if path == "/v1" or path.startswith("/v1/"):
+        # Compare the path component only: ``/v1?x=1`` is already under the
+        # ``/v1`` base, but it used to be appended to that base and became
+        # ``/v1/v1?x=1``.
+        path_only = path.split("?", 1)[0]
+        if path_only == "/v1" or path_only.startswith("/v1/"):
             path = path[3:]
+        # A non-ASCII request path reached http.client, whose request line is
+        # ASCII-only and killed the handler thread.  Quote it for the wire.
+        path = urllib.parse.quote(path, safe="/?&=%:@!$'()*+,;~-._[]")
         return base + path
 
     def _forward(self, method: str, body: Optional[bytes] = None) -> None:
@@ -1827,10 +1855,32 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
                 with contextlib.suppress(OSError):
                     self.wfile.write(raw)
                 return
-            raw = exc.read()
-            self.send_response(exc.code)
-            ctype = exc.headers.get("Content-Type") if exc.headers else None
-            self.send_header("Content-Type", ctype or "application/json")
+            try:
+                raw = exc.read()
+                status = exc.code
+                headers = list(exc.headers.items()) if exc.headers else []
+            except (OSError, http.client.HTTPException) as read_exc:
+                # A truncated error body used to escape do_POST as
+                # IncompleteRead and close the client connection.  Relay a
+                # synthetic 502 that still names the upstream status.
+                raw = json.dumps(
+                    {
+                        "error": {
+                            "message": "custom endpoint proxy could not read "
+                            "the upstream HTTP %d error body: %s"
+                            % (exc.code, read_exc)
+                        }
+                    }
+                ).encode()
+                status = 502
+                headers = [("Content-Type", "application/json")]
+            self.send_response(status)
+            for name, value in _forwardable_response_headers(headers):
+                self.send_header(name, value)
+            if not any(
+                name.lower() == "content-type" for name, _ in headers
+            ):
+                self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             with contextlib.suppress(OSError):
@@ -1942,11 +1992,20 @@ def start_prep_proxy(target_base: str, prep: Mapping[str, Any]) -> Tuple[str, st
     except ConfigError as exc:
         return "", str(exc)
     try:
+        normalized_prep = dict(prep)
+        json.dumps(normalized_prep)
+    except (TypeError, ValueError, RecursionError) as exc:
+        # The prep object is merged into every request body.  Accepting an
+        # unserialisable value here only failed on the first POST, in the
+        # handler thread, where the client saw a disconnect instead of the
+        # configuration error.
+        return "", "agent prep object is not JSON-serialisable: %s" % exc
+    try:
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _PrepProxyHandler)
     except OSError as exc:
         return "", "%s: %s" % (type(exc).__name__, exc)
     server.target_base = normalized_target                  # type: ignore[attr-defined]
-    server.prep = dict(prep)                              # type: ignore[attr-defined]
+    server.prep = normalized_prep                         # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     server._gdp_thread = thread                           # type: ignore[attr-defined]
@@ -2395,7 +2454,7 @@ def dsh_patch_text(
     settings = _provider_family_settings(selection)
     family = settings["family"]
     if family == "endpoint":
-        model_name = (
+        model_name = _redacted_model_name(
             raw_model
             or model_name_override
             or selection.model_name
@@ -2782,18 +2841,15 @@ def claude_environment(
     if selection is None or selection.model is None or selection.is_default:
         # The CLI owns the model, but an explicit level still reaches Claude
         # Code; Claude Code ignores a level outside its own vocabulary.
-        override = reasoning_effort_override()
+        override = _claude_code_effort(reasoning_effort_override())
         return {"CLAUDE_CODE_EFFORT_LEVEL": override} if override else {}
     settings = _provider_family_settings(selection)
     family = settings["family"]
     if family in ("claude", "gpt"):
         # Native Claude (and GPT over the harness) keep the model default
         # unless the operator named a level.
-        return (
-            {"CLAUDE_CODE_EFFORT_LEVEL": str(settings["effort"])}
-            if settings["effort"]
-            else {}
-        )
+        effort = _claude_code_effort(settings["effort"])
+        return {"CLAUDE_CODE_EFFORT_LEVEL": effort} if effort else {}
     if family == "endpoint":
         return {}
     root = str(settings["base_url"] or "").rstrip("/")
@@ -2817,9 +2873,10 @@ def claude_environment(
             # override of the DeepSeek effort applies here too.  Claude Code
             # ignores a value outside low/medium/high/max and keeps its own
             # default, so an ``off`` override cannot break this route.
-            "CLAUDE_CODE_EFFORT_LEVEL": str(
+            "CLAUDE_CODE_EFFORT_LEVEL": _claude_code_effort(
                 settings["effort"] or DEEPSEEK_DEFAULT_EFFORT
-            ),
+            )
+            or "high",
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "786432",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         }
@@ -2930,6 +2987,25 @@ def effective_agent_model(cmd: Sequence[Any]) -> Dict[str, Any]:
         "harness": None,
         "source": "external CLI config (not recorded; the CLI owns the model)",
     }
+
+
+def _redacted_model_name(name: Any) -> Any:
+    """A model name with a URL-shaped value's credential removed.
+
+    ``--agent-model-name`` is a provider model id, not a URL, but an operator
+    can pass one.  Persisting that value verbatim in ``command.json``,
+    ``status.json`` or the generated DSH patch would archive the credential;
+    only URL-shaped values are rewritten so an ordinary id stays readable.
+    """
+    if not isinstance(name, str):
+        return name
+    text = name.strip()
+    if "://" in text or text.startswith("//"):
+        try:
+            return redact_endpoint_url(text)
+        except (TypeError, ValueError):
+            return "[REDACTED]"
+    return name
 
 
 def redact_prep_object(value: Any) -> Any:

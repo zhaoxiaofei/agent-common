@@ -9,8 +9,8 @@ behaviour that matters:
 
 * the schedule is 10s, 20s, ... capped at 3600s (ten retries);
 * the compaction route names a second Dots key;
-* the paper-refine adapters that cannot import a sibling module carry the same
-  constants.
+* the paper-refine adapters import the shared runtime (this repository is the
+  single source of truth; there are no per-checkout copies of the constants).
 
     python3 repos/agent-common/check_llm_policy.py
 """
@@ -68,7 +68,14 @@ def main() -> int:
             % (CANONICAL_MODULE, type(exc).__name__, exc)
         )
 
-    document = json.loads(CANONICAL_JSON.read_text(encoding="utf-8"))
+    try:
+        document = json.loads(CANONICAL_JSON.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, RecursionError) as exc:
+        print("FAIL cannot read canonical policy: %s: %s" % (type(exc).__name__, exc))
+        return 1
+    if not isinstance(document, dict):
+        print("FAIL canonical policy is not a JSON object")
+        return 1
     # The checker must not accept a policy that load_policy would reject and
     # silently replace with the defaults.  Import here, after the syntax check,
     # so an invalid canonical module is reported instead of crashing the checker
@@ -84,32 +91,54 @@ def main() -> int:
     if _llm_retry is not None:
         try:
             _llm_retry._merge_policy(document)
-        except (TypeError, ValueError, OverflowError) as exc:
+        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
             problems.append("the runtime rejects this policy: %s" % exc)
     retry = document.get("retry") or {}
+    if not isinstance(retry, dict):
+        problems.append("retry is not a policy object")
+        retry = {}
     expected = [10, 20, 40, 80, 160, 320, 640, 1280, 2560, 3600]
-    initial = float(retry.get("initial_delay_seconds", 0))
-    multiplier = float(retry.get("multiplier", 0))
-    maximum = float(retry.get("max_delay_seconds", 0))
-    max_retries = int(retry.get("max_retries", 0))
-    schedule = [
-        min(initial * multiplier ** index, maximum)
-        for index in range(max_retries)
-    ]
+    try:
+        initial = float(retry.get("initial_delay_seconds", 0))
+        multiplier = float(retry.get("multiplier", 0))
+        maximum = float(retry.get("max_delay_seconds", 0))
+        max_retries = int(retry.get("max_retries", 0))
+        schedule = [
+            min(initial * multiplier ** index, maximum)
+            for index in range(max_retries)
+        ]
+    except (TypeError, ValueError, OverflowError) as exc:
+        # A string or an extreme finite value is rejected by the runtime; the
+        # checker must report that, not raise from the post-merge arithmetic.
+        problems.append("retry values are not a usable schedule: %s" % exc)
+        schedule = []
     if schedule != expected:
         problems.append("retry schedule is %r, expected %r" % (schedule, expected))
-    if "RATE_LIMIT" not in (retry.get("retryable_error_codes") or []):
+    codes = retry.get("retryable_error_codes")
+    if not isinstance(codes, list) or "RATE_LIMIT" not in codes:
         problems.append("RATE_LIMIT is not retryable")
-    if 429 not in (retry.get("retryable_http_statuses") or []):
+    statuses = retry.get("retryable_http_statuses")
+    if not isinstance(statuses, list) or 429 not in statuses:
         problems.append("HTTP 429 is not retryable")
 
     dots = document.get("dots") or {}
+    if not isinstance(dots, dict):
+        problems.append("dots is not a policy object")
+        dots = {}
     if dots.get("regular_api_key_env") == dots.get("compaction_api_key_env"):
         problems.append("regular and compaction Dots keys are the same variable")
     if not dots.get("compaction_provider"):
         problems.append("no dedicated compaction provider is declared")
     compaction = document.get("compaction") or {}
-    if int(compaction.get("summarization_max_tokens") or 0) <= 0:
+    if not isinstance(compaction, dict):
+        problems.append("compaction is not a policy object")
+        compaction = {}
+    try:
+        max_summary = int(compaction.get("summarization_max_tokens") or 0)
+    except (TypeError, ValueError, OverflowError) as exc:
+        problems.append("summarization_max_tokens is not an integer: %s" % exc)
+        max_summary = 0
+    if max_summary <= 0:
         problems.append("summarization_max_tokens is not a positive bound")
 
     for directory in COPIES:
@@ -117,7 +146,14 @@ def main() -> int:
             copy = directory / name
             if not copy.is_file():
                 problems.append("missing copy: %s" % copy)
-            elif digest(copy) != digest(CANONICAL_DIR / name):
+                continue
+            try:
+                copy_digest = digest(copy)
+                canonical_digest = digest(CANONICAL_DIR / name)
+            except OSError as exc:
+                problems.append("cannot read %s: %s" % (copy, exc))
+                continue
+            if copy_digest != canonical_digest:
                 problems.append("copy differs from canonical: %s" % copy)
 
     # The paper-refine adapters now consume the shared runtime rather than
@@ -132,7 +168,11 @@ def main() -> int:
             if (ROOT / "paper-refine").is_dir():
                 problems.append("missing adapter: %s" % adapter)
             continue
-        text = adapter.read_text(encoding="utf-8")
+        try:
+            text = adapter.read_text(encoding="utf-8")
+        except OSError as exc:
+            problems.append("cannot read adapter %s: %s" % (adapter, exc))
+            continue
         if "import model_runtime as rt" not in text:
             problems.append("%s does not import the shared model runtime" % adapter)
         if name in ("paper_dots_agent.py", "paper_qwen_agent.py"):
@@ -145,9 +185,16 @@ def main() -> int:
         for problem in problems:
             print("FAIL %s" % problem)
         return 1
+    try:
+        canonical_digest = digest(CANONICAL_JSON)[:16]
+    except OSError as exc:
+        # Reaching here means the copy checks were disabled or empty; the
+        # canonical read itself is still a file I/O that must not crash.
+        print("FAIL cannot read canonical policy: %s" % exc)
+        return 1
     print(
         "OK schedule %r; canonical and %d submodule checkouts share sha256 %s"
-        % (expected, len(COPIES), digest(CANONICAL_JSON)[:16])
+        % (expected, len(COPIES), canonical_digest)
     )
     return 0
 

@@ -69,24 +69,49 @@ def main() -> int:
     if not CANONICAL.is_file():
         print("missing canonical catalog: %s" % CANONICAL)
         return 1
-    expected = digest(CANONICAL)
-    document = json.loads(CANONICAL.read_text(encoding="utf-8"))
-    if document.get("schema_version") != 1:
-        problems.append("unsupported schema_version %r" % document.get("schema_version"))
+    try:
+        expected = digest(CANONICAL)
+        document = json.loads(CANONICAL.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, RecursionError) as exc:
+        # A checker reports, never crashes.  Invalid JSON, a document that is
+        # not an object, and a deeply nested value all used to escape main().
+        print("FAIL cannot read canonical catalog: %s: %s" % (type(exc).__name__, exc))
+        return 1
+    if not isinstance(document, dict):
+        print("FAIL canonical catalog is not a JSON object")
+        return 1
+    schema_version = document.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != 1:
+        # ``True == 1`` in Python; a boolean schema version is not the
+        # documented integer.
+        problems.append("unsupported schema_version %r" % (schema_version,))
+    models = document.get("models")
+    if not isinstance(models, list):
+        print("FAIL canonical catalog models is not a list")
+        return 1
     seen = set()
-    for entry in document.get("models", []):
+    for entry in models:
+        if not isinstance(entry, dict):
+            problems.append("model entry is not an object %r" % (entry,))
+            continue
         model_id = entry.get("id")
-        if not model_id or model_id in seen:
+        # A malformed id (a list, an object, a number) cannot be a set key:
+        # report it instead of raising TypeError from the duplicate check.
+        if not isinstance(model_id, str) or not model_id or model_id in seen:
             problems.append("missing or duplicate model id %r" % (model_id,))
             continue
         seen.add(model_id)
         context = entry.get("context_window")
         output = entry.get("max_tokens")
-        if not isinstance(context, int) or context <= 0:
+
+        def _positive_int(value) -> bool:
+            return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+        if not _positive_int(context):
             problems.append("%s: bad context_window %r" % (model_id, context))
-        if not isinstance(output, int) or output <= 0:
+        if not _positive_int(output):
             problems.append("%s: bad max_tokens %r" % (model_id, output))
-        elif isinstance(context, int) and output >= context:
+        elif _positive_int(context) and output >= context:
             problems.append(
                 "%s: max_tokens %d does not fit context_window %d"
                 % (model_id, output, context)
@@ -101,27 +126,30 @@ def main() -> int:
         if not entry.get("verified_at"):
             problems.append("%s: missing verified_at" % model_id)
         chat = entry.get("chat_max_tokens")
-        if not isinstance(chat, int) or chat <= 0:
+        if not _positive_int(chat):
             problems.append("%s: bad chat_max_tokens %r" % (model_id, chat))
-        elif isinstance(context, int) and chat >= context:
+        elif _positive_int(context) and chat >= context:
             problems.append(
                 "%s: chat_max_tokens %d does not fit context_window %d"
                 % (model_id, chat, context)
             )
-        elif isinstance(output, int) and chat < output:
+        elif _positive_int(output) and chat < output:
             problems.append(
                 "%s: chat_max_tokens %d is below max_tokens %d"
                 % (model_id, chat, output)
             )
         level = entry.get("default_reasoning_level")
-        if level is not None and level not in {
-            "minimal",
-            "low",
-            "medium",
-            "high",
-            "xhigh",
-            "max",
-        }:
+        if level is not None and (
+            not isinstance(level, str)
+            or level not in {
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            }
+        ):
             problems.append(
                 "%s: bad default_reasoning_level %r" % (model_id, level)
             )
@@ -140,7 +168,13 @@ def main() -> int:
     for path in COPIES:
         if not path.is_file():
             problems.append("missing copy: %s" % path)
-        elif digest(path) != expected:
+            continue
+        try:
+            copy_digest = digest(path)
+        except OSError as exc:
+            problems.append("cannot read copy %s: %s" % (path, exc))
+            continue
+        if copy_digest != expected:
             problems.append("copy differs from canonical: %s" % path)
     for model_id in sorted(EXPECTED_MODEL_IDS - seen):
         problems.append("missing expected model id %s" % model_id)
