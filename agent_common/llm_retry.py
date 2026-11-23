@@ -693,27 +693,18 @@ class _RetryProxyHandler(http.server.BaseHTTPRequestHandler):
         headers: Iterable[Tuple[str, str]],
         response: http.client.HTTPResponse,
     ) -> None:
-        header_items = list(headers)
-        declared_length = next(
-            (
-                value
-                for name, value in header_items
-                if name.lower() == "content-length"
-            ),
-            None,
-        )
-        self.send_response(status)
-        self._copy_headers(header_items)
-        if declared_length is not None:
-            # ``_forwardable_response_headers`` drops the framing header;
-            # re-emit the upstream value so a truncated success body is a
-            # client-visible IncompleteRead instead of a silent short 200.
-            self.send_header("Content-Length", declared_length)
-        self.send_header("Connection", "close")
-        self.end_headers()
-        _relay_response_body(
-            response, lambda chunk: (self.wfile.write(chunk), self.wfile.flush())
-        )
+        # Buffer before writing the response line.  Streaming a body whose
+        # upstream Content-Length was stripped let a truncated completion reach
+        # the caller as a normal 200; an IncompleteRead must become a typed
+        # error instead, and only a known-complete body may be sent.
+        try:
+            body = response.read()
+        except (OSError, http.client.HTTPException) as exc:
+            self._send_error(
+                502, "upstream response body was truncated: %s" % (exc,)
+            )
+            return
+        self._send(status, headers, body)
 
     def _copy_headers(self, headers: Iterable[Tuple[str, str]]) -> None:
         # send_response() already wrote Server/Date/Content-Length; copying
@@ -824,14 +815,15 @@ class RetryProxy:
         """
         requested = path or "/"
         # A loopback proxy receives origin-form targets (``/v1/chat``).  An
-        # absolute-form target (``http://other/v1/chat``) or a slash-less path
-        # must not be concatenated into a nonsense upstream path; reject it so
-        # the handler can answer 400.
+        # absolute-form or network-path target names another origin, so it must
+        # not be concatenated into a nonsense upstream path; reject it so the
+        # handler can answer 400.  A slash-less origin-form path is not another
+        # origin: normalise it to ``/...`` instead of refusing a legal client.
         parsed_request = urllib.parse.urlsplit(requested)
         if parsed_request.scheme or parsed_request.netloc or requested.startswith("//"):
             raise ValueError("absolute-form request targets are not supported")
         if not requested.startswith("/"):
-            raise ValueError("request target must start with '/'")
+            requested = "/" + requested
         # Compare only the path component: ``/v1?x=1`` is already under a
         # ``/v1`` prefix even though it does not start with ``/v1/``.
         path_only = requested.split("?", 1)[0]
@@ -844,7 +836,10 @@ class RetryProxy:
             target = self._prefix + requested
         if self._query:
             target += ("&" if "?" in target else "?") + self._query
-        return target
+        # http.client writes the request line as ASCII; a raw non-ASCII path
+        # raised UnicodeEncodeError and killed the handler thread.  Percent
+        # encode it, keeping existing escapes and reserved characters.
+        return urllib.parse.quote(target, safe="/?&=%:@!$'()*+,;~-._[]")
 
     def open(
         self,

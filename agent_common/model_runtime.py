@@ -1879,7 +1879,10 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
         path_only = path.split("?", 1)[0]
         if path_only == "/v1" or path_only.startswith("/v1/"):
             path = path[3:]
-        return base + path
+        # http.client writes the request line as ASCII; a raw non-ASCII path
+        # raised UnicodeEncodeError and killed the handler thread.  Percent
+        # encode it, keeping existing escapes and reserved characters.
+        return base + urllib.parse.quote(path, safe="/?&=%:@!$'()*+,;~-._[]")
 
     def _forward(self, method: str, body: Optional[bytes] = None) -> None:
         headers = _forwardable_request_headers(

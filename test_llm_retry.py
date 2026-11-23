@@ -437,10 +437,10 @@ class TruncatedSuccessBodyTests(unittest.TestCase):
             )
             connection.request("POST", "/v1/chat", body=b"{}")
             response = connection.getresponse()
-            self.assertEqual(response.status, 200)
-            self.assertEqual(response.getheader("Content-Length"), "100")
-            with self.assertRaises(http.client.IncompleteRead):
-                response.read()
+            # The relay buffers the body before writing the response line, so
+            # an IncompleteRead becomes a typed 502 instead of a short 200.
+            self.assertEqual(response.status, 502)
+            response.read()
             connection.close()
         finally:
             proxy.stop()

@@ -277,7 +277,10 @@ class PrepProxyRegressionTests(unittest.TestCase):
         self.assertEqual(base, "")
         self.assertIn("must not carry a credential", error)
 
-    def test_a_non_ascii_path_gets_a_400(self):
+    def test_a_non_ascii_path_is_percent_encoded(self):
+        # A raw non-ASCII request target is legal-ish on the wire but not in
+        # http.client's ASCII request line: the handler used to die.  The path
+        # is now percent-encoded and forwarded (the loopback answers 200).
         upstream = _start_server(_QuietHandler)
         base, error = model_runtime.start_prep_proxy(
             "http://127.0.0.1:%d/v1" % upstream.server_address[1], {}
@@ -286,7 +289,7 @@ class PrepProxyRegressionTests(unittest.TestCase):
         try:
             port = int(base.rsplit(":", 1)[1].split("/", 1)[0])
             response = _raw_exchange(port, "GET /caf\xe9 HTTP/1.0")
-            self.assertIn(b"400 Bad Request", response)
+            self.assertIn(b"200 OK", response)
         finally:
             model_runtime.stop_prep_proxy(base)
             _stop_server(upstream)
@@ -324,23 +327,32 @@ class RetryProxyRegressionTests(unittest.TestCase):
         self.assertNotIn("secret", str(caught.exception))
 
     def test_malformed_targets_are_rejected(self):
+        # Only targets that name another origin are refused; a slash-less
+        # origin-form path is normalised (a legal client may omit the slash).
         proxy = llm_retry.RetryProxy("https://host/v1")
-        for target in ("http://other/v1/chat", "chat", "//other/v1"):
+        for target in ("http://other/v1/chat", "//other/v1"):
             with self.subTest(target=target):
                 with self.assertRaises(ValueError):
                     proxy.target_path(target)
+        self.assertEqual(proxy.target_path("chat"), "/v1/chat")
 
-    def test_absolute_form_and_non_ascii_targets_get_a_400(self):
-        proxy = llm_retry.RetryProxy("https://upstream.example/v1")
+    def test_absolute_form_is_refused_and_non_ascii_is_forwarded(self):
+        upstream = _start_server(_QuietHandler)
+        proxy = llm_retry.RetryProxy(
+            "http://127.0.0.1:%d/v1" % upstream.server_address[1]
+        )
         base = proxy.start()
         try:
             port = int(base.rsplit(":", 1)[1].split("/", 1)[0])
-            for target in ("GET http://other/v1/chat HTTP/1.0", "GET /caf\xe9 HTTP/1.0"):
-                with self.subTest(target=target):
-                    response = _raw_exchange(port, target)
-                    self.assertIn(b"400 Bad Request", response)
+            absolute = _raw_exchange(port, "GET http://other/v1/chat HTTP/1.0")
+            self.assertIn(b"400 Bad Request", absolute)
+            # The non-ASCII target is percent-encoded and forwarded instead of
+            # killing the handler thread; the loopback answers 200.
+            non_ascii = _raw_exchange(port, "GET /caf\xe9 HTTP/1.0")
+            self.assertIn(b"200 OK", non_ascii)
         finally:
             llm_retry.stop_retry_proxy(proxy)
+            _stop_server(upstream)
 
 
 class DshEventRegressionTests(unittest.TestCase):
