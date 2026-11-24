@@ -212,13 +212,16 @@ def _merge_policy(document: Mapping[str, Any]) -> Dict[str, Any]:
     retry["max_retries"] = int(retry["max_retries"])
     retry["jitter_ratio"] = float(retry["jitter_ratio"])
     retry["retry_after_cap_seconds"] = float(retry["retry_after_cap_seconds"])
-    # A string is iterable, so the old code accepted "429" and expanded it to
-    # the character codes [2, 4, 9] instead of the one HTTP status 429.
-    statuses = retry.get("retryable_http_statuses") or []
+    # ``or []`` treated a present-but-empty mapping/string as absent before
+    # the type check, so ``{}`` or ``""`` loaded "successfully" and disabled
+    # every retry.  Absent (or null, which the merge drops) keeps the
+    # default list; a present value must be a list/tuple.  An explicit empty
+    # list stays a deliberate "retry nothing" policy.
+    statuses = retry.get("retryable_http_statuses")
     if not isinstance(statuses, (list, tuple)):
         raise ValueError("retry.retryable_http_statuses must be a list of integers")
     retry["retryable_http_statuses"] = sorted({int(status) for status in statuses})
-    codes = retry.get("retryable_error_codes") or []
+    codes = retry.get("retryable_error_codes")
     if not isinstance(codes, (list, tuple)):
         raise ValueError("retry.retryable_error_codes must be a list of strings")
     retry["retryable_error_codes"] = sorted({str(code) for code in codes if code})

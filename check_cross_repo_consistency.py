@@ -224,6 +224,17 @@ def expected_fields(
     return fields
 
 
+def _redacted(value: Any) -> Any:
+    """A URL-valued field with credentials removed, for the failure output."""
+    if not isinstance(value, str):
+        return value
+    try:
+        from agent_common.model_runtime import redact_endpoint_url
+    except Exception:  # noqa: BLE001 - the probe's own failure is reported elsewhere
+        return value
+    return redact_endpoint_url(value)
+
+
 def main() -> int:
     catalogue, error = _read_catalogue()
     if error:
@@ -266,9 +277,19 @@ def main() -> int:
                 value = observed[model_id][field]
                 expected = catalogue[model_id].get(field)
                 if expected != value:
+                    # A drifted checkout can report a credential-bearing
+                    # base_url; the checker used to print it verbatim three
+                    # times.  model_runtime's own recorder redacts, so the
+                    # mismatch output must too.
                     problems.append(
                         "%s: %s.%s is %r, catalog says %r"
-                        % (label, model_id, field, value, expected)
+                        % (
+                            label,
+                            model_id,
+                            field,
+                            _redacted(value),
+                            _redacted(expected),
+                        )
                     )
     if problems:
         for problem in problems:

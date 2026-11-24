@@ -323,6 +323,53 @@ def _carries_unparsed_credential(text: str) -> bool:
     return False
 
 
+def _usable_textual_authority(authority: str) -> bool:
+    """Whether a scheme-less authority names a host a client could use."""
+    try:
+        parsed = urllib.parse.urlsplit("//" + authority)
+        host = parsed.hostname
+        # ``port`` raises for a malformed port; it is not a secret carrier.
+        parsed.port
+    except ValueError:
+        return False
+    return bool(host)
+
+
+def _textual_endpoint_secret(text: str) -> str:
+    """The userinfo/query secret of an unparsable endpoint, or ``""``.
+
+    Used by ``split_endpoint_credentials`` for a scheme-less form such as
+    ``user:pw@host/v1`` that ``urlsplit`` reads as scheme ``user`` with no
+    netloc.  A value whose authority is not usable (for example the
+    unparsable host ``[bad``) keeps the documented empty-secret result: there
+    is no endpoint to carry the credential to.
+    """
+    before_query = str(text or "").split("#", 1)[0]
+    head, _, query = before_query.partition("?")
+    authority = head
+    if "://" in authority:
+        authority = authority.split("://", 1)[1]
+    elif authority.startswith("//"):
+        authority = authority[2:]
+    authority = authority.split("/", 1)[0]
+    if "@" in authority:
+        if not _usable_textual_authority(authority):
+            return ""
+        userinfo = authority.rsplit("@", 1)[0]
+        _user, separator, password = userinfo.partition(":")
+        if separator:
+            return password
+    if query:
+        try:
+            pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+        except ValueError:
+            pairs = []
+        for key, value in pairs:
+            if _secret_query_key(key):
+                return value
+    return ""
+
+
 def _redacted_endpoint_text(value: Optional[str]) -> Optional[str]:
     """Redact a URL-shaped or otherwise credential-bearing value.
 
@@ -373,18 +420,23 @@ def split_endpoint_credentials(url: str) -> Tuple[str, str]:
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         # A scheme-relative (``//user:pw@host/v1``) or non-http(s) form cannot be
         # used as an endpoint, but it must not leak a credential or query secret
-        # into the generated patch/argv/environment either.
-        if endpoint_credentials(text):
-            return _safe_endpoint_text(text), ""
+        # into the generated patch/argv/environment either.  A bare
+        # ``user:pw@host/v1`` parses with scheme "user" and no netloc, so the
+        # old ``endpoint_credentials`` check missed it and returned the raw
+        # credential; detect it textually and carry the secret separately.
+        secret = _textual_endpoint_secret(text)
+        if secret or endpoint_credentials(text) or _carries_unparsed_credential(text):
+            return _safe_endpoint_text(text), secret
         return text, ""
     secret = ""
     netloc = parsed.netloc
     if "@" in netloc:
         userinfo, _, host = netloc.rpartition("@")
-        if ":" in userinfo:
-            secret = userinfo.rsplit(":", 1)[1]
-        else:
-            secret = userinfo
+        # Split at the first colon: a legal password may itself contain a
+        # colon, and ``rsplit`` returned only its tail.  A bare username is
+        # not a secret, so it is not moved into the credential channel.
+        _user, separator, password = userinfo.partition(":")
+        secret = password if separator else ""
         netloc = host
     kept: list[Tuple[str, str]] = []
     if parsed.query:
@@ -684,13 +736,21 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
                         % (name, provider, _MODEL_CATALOG_PATH)
                     )
                 update["dsh_provider"] = provider
-            if facts.get("base_url"):
+            if "base_url" in facts and facts["base_url"] is not None:
+                # Only absent/None means absent.  A present falsy value
+                # (``[]``, ``0``, ``False``, ``""``) was dropped by the old
+                # truthiness guard, so the import kept the built-in localhost
+                # fallback instead of rejecting the malformed catalog.
+                raw_base = facts["base_url"]
+                if not isinstance(raw_base, str) or not raw_base.strip():
+                    raise ConfigError(
+                        "model %r: base_url %r must be a non-empty string in %s"
+                        % (name, raw_base, _MODEL_CATALOG_PATH)
+                    )
                 # The catalog is a shared, agent-readable artifact.  Keep the
                 # public table and the exported constants credential-free and
                 # carry the live secret separately.
-                safe_base, base_secret = split_endpoint_credentials(
-                    str(facts["base_url"])
-                )
+                safe_base, base_secret = split_endpoint_credentials(raw_base)
                 try:
                     # Validate the URL shape at load time; the DSH route fails
                     # on a bad base only when a run is configured, while the
@@ -2119,7 +2179,11 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
         # http.client writes the request line as ASCII; a raw non-ASCII path
         # raised UnicodeEncodeError and killed the handler thread.  Percent
         # encode it, keeping existing escapes and reserved characters.
-        return base + urllib.parse.quote(path, safe="/?&=%:@!$'()*+,;~-._[]")
+        target = base + urllib.parse.quote(path, safe="/?&=%:@!$'()*+,;~-._[]")
+        query = str(getattr(self.server, "target_query", "") or "")
+        if query:
+            target += ("&" if "?" in target else "?") + query
+        return target
 
     def _forward(self, method: str, body: Optional[bytes] = None) -> None:
         headers = _forwardable_request_headers(
@@ -2338,6 +2402,24 @@ def start_prep_proxy(target_base: str, prep: Mapping[str, Any]) -> Tuple[str, st
         normalized_target = endpoint_base(target_text)
     except ConfigError as exc:
         return "", str(exc)
+    # ``endpoint_base`` deliberately drops the query for artifact safety.  A
+    # gateway can require a non-secret query parameter (``api-version=2024``),
+    # so keep the non-secret part for the forwarded request only.
+    target_query = ""
+    try:
+        parsed_target = urllib.parse.urlsplit(target_text)
+        if parsed_target.query:
+            pairs = urllib.parse.parse_qsl(
+                parsed_target.query, keep_blank_values=True
+            )
+            kept = [
+                (key, value)
+                for key, value in pairs
+                if not _secret_query_key(key)
+            ]
+            target_query = urllib.parse.urlencode(kept, doseq=True)
+    except ValueError:
+        target_query = ""
     try:
         prep_object = dict(prep)
         # Fail at startup, not inside the first request's handler thread.
@@ -2350,6 +2432,7 @@ def start_prep_proxy(target_base: str, prep: Mapping[str, Any]) -> Tuple[str, st
     except OSError as exc:
         return "", "%s: %s" % (type(exc).__name__, exc)
     server.target_base = normalized_target                  # type: ignore[attr-defined]
+    server.target_query = target_query                     # type: ignore[attr-defined]
     server.prep = prep_object                              # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -2824,6 +2907,10 @@ def _normalized_route_base_url(value: Any) -> str:
             return text.rstrip("/")
         if parsed.netloc and parsed.scheme not in ("http", "https"):
             raise
+        if _carries_unparsed_credential(text):
+            # ``user:pw@host/v1`` parses as scheme "user" with no netloc and
+            # used to fall through here verbatim into the Codex/Claude env.
+            return _safe_endpoint_text(text).rstrip("/")
         return text.rstrip("/")
 
 

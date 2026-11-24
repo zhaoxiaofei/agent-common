@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import urllib.parse
 from pathlib import Path
 
 COMMON = Path(__file__).resolve().parent
@@ -135,6 +136,35 @@ def main() -> int:
                 "%s: chat_max_tokens %d is below max_tokens %d"
                 % (model_id, chat, output)
             )
+        # The runtime rejects these at import; the checker used to report OK
+        # and exit 0 for a catalog the runtime could not load.
+        base_url = entry.get("base_url")
+        if base_url is not None:
+            if not isinstance(base_url, str) or not base_url.strip():
+                problems.append("%s: bad base_url %r" % (model_id, base_url))
+            else:
+                try:
+                    parsed = urllib.parse.urlsplit(base_url)
+                    host = parsed.hostname
+                    port = parsed.port
+                except ValueError as exc:
+                    problems.append("%s: bad base_url %r (%s)" % (model_id, base_url, exc))
+                else:
+                    if not host:
+                        problems.append(
+                            "%s: base_url has no host: %r" % (model_id, base_url)
+                        )
+                    elif port is not None and not 0 < port <= 65535:
+                        problems.append(
+                            "%s: base_url has an invalid port: %r"
+                            % (model_id, base_url)
+                        )
+        for field in ("api_key_env", "provider"):
+            value = entry.get(field)
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                problems.append("%s: bad %s %r" % (model_id, field, value))
         level = entry.get("default_reasoning_level")
         # Check the type before set membership: a list/dict level is
         # unhashable and used to abort the checker with a TypeError.
