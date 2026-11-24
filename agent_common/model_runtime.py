@@ -45,6 +45,7 @@ if __package__:
         _read_request_body,
         _relay_response_body,
         _request_is_chunked,
+        _yaml_scalar,
         dots_dsh_overlay,
         load_policy as _load_llm_policy,
         retry_policy_yaml,
@@ -62,6 +63,7 @@ else:  # pragma: no cover - a paper-refine frozen root has no package
         _read_request_body,
         _relay_response_body,
         _request_is_chunked,
+        _yaml_scalar,
         dots_dsh_overlay,
         load_policy as _load_llm_policy,
         retry_policy_yaml,
@@ -442,6 +444,17 @@ _CREDENTIAL_KEY_NAMES = frozenset(
         "accesskeys",
         "accesskeyid",
         "subscriptionkey",
+        # Signed-URL / browser-session spellings.  AWS presigned URLs carry
+        # ``X-Amz-Signature`` and signed gateway URLs commonly carry
+        # ``signature``/``sig``; neither is an ordinary generation parameter.
+        "signature",
+        "signatures",
+        "sig",
+        "sigs",
+        "cookie",
+        "cookies",
+        "refreshtoken",
+        "refreshtokens",
     }
 )
 _CREDENTIAL_KEY_SUFFIXES = (
@@ -455,6 +468,9 @@ _CREDENTIAL_KEY_SUFFIXES = (
     "_authorization",
     "_auth",
     "_apikey",
+    "_signature",
+    "_sig",
+    "_cookie",
 )
 
 
@@ -576,8 +592,22 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
                     "model %r (%s) is missing from %s"
                     % (name, entry["id"], _MODEL_CATALOG_PATH)
                 )
-            context_window = int(facts["context_window"])
-            max_tokens = int(facts["max_tokens"])
+            # ``int(...)`` used to accept 32768.9 and "150000", silently
+            # changing the cap while check_model_catalog rejected the same
+            # document.  Require the exact JSON integer type both places accept.
+            for capacity in ("context_window", "max_tokens"):
+                if type(facts[capacity]) is not int:
+                    raise ConfigError(
+                        "model %r: %s %r must be an integer in %s"
+                        % (
+                            name,
+                            capacity,
+                            facts[capacity],
+                            _MODEL_CATALOG_PATH,
+                        )
+                    )
+            context_window = facts["context_window"]
+            max_tokens = facts["max_tokens"]
             if max_tokens <= 0 or context_window <= max_tokens:
                 raise ConfigError(
                     "model %r: max_tokens %d must be positive and below "
@@ -590,7 +620,15 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
             }
             chat_max_tokens = facts.get("chat_max_tokens")
             if chat_max_tokens is not None:
-                chat_max_tokens = int(chat_max_tokens)
+                if type(chat_max_tokens) is not int:
+                    raise ConfigError(
+                        "model %r: chat_max_tokens %r must be an integer in %s"
+                        % (
+                            name,
+                            chat_max_tokens,
+                            _MODEL_CATALOG_PATH,
+                        )
+                    )
                 if (
                     chat_max_tokens <= 0
                     or chat_max_tokens < max_tokens
@@ -1744,7 +1782,12 @@ def _endpoint_catalog(base_url: str, api_key: str = "", timeout: float = 5.0) ->
         "%s/models" % base_url.rstrip("/"), headers=headers, method="GET"
     )
     try:
-        opener = urllib.request.build_opener(_NoRedirectHandler)
+        # An explicit empty ProxyHandler keeps urllib's default environment
+        # proxy out of this key-bearing request: a corporate/attacker proxy must
+        # not receive the Authorization header just because HTTP(S)_PROXY is set.
+        opener = urllib.request.build_opener(
+            _NoRedirectHandler, urllib.request.ProxyHandler({})
+        )
         with opener.open(request, timeout=timeout) as response:
             body = json.loads(response.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
@@ -1770,8 +1813,22 @@ def _endpoint_catalog(base_url: str, api_key: str = "", timeout: float = 5.0) ->
         raise _EndpointProbeError(
             "the endpoint /models listing failed: %s" % exc
         ) from None
-    data = body.get("data") if isinstance(body, dict) else None
-    return [item for item in (data or []) if isinstance(item, dict) and item.get("id")]
+    if not isinstance(body, dict):
+        raise _EndpointProbeError(
+            "the endpoint /models listing returned a non-object JSON body; "
+            "expected an OpenAI-compatible {\"data\": [...]} document"
+        )
+    data = body.get("data")
+    if not isinstance(data, list):
+        # A scalar/array body (or a missing/non-list ``data``) is a malformed
+        # listing, not the documented 404/405 "no listing" case.  Returning []
+        # made resolve_endpoint_model fall back to "default" and report a
+        # successful preflight for a broken endpoint.
+        raise _EndpointProbeError(
+            "the endpoint /models listing has no data list; "
+            "expected an OpenAI-compatible {\"data\": [...]} document"
+        )
+    return [item for item in data if isinstance(item, dict) and item.get("id")]
 
 
 def _endpoint_context(entries: Sequence[Mapping[str, Any]], model: str) -> Optional[int]:
@@ -1925,7 +1982,11 @@ def parse_prep_json(value: Any) -> Dict[str, Any]:
     return parsed
 
 
-_PREP_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+#: Same redirect refusal for the prep proxy; the explicit empty ProxyHandler
+#: also keeps the caller's Authorization header off an environment proxy.
+_PREP_OPENER = urllib.request.build_opener(
+    _NoRedirectHandler, urllib.request.ProxyHandler({})
+)
 
 
 class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -2353,11 +2414,22 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
         }
     family = _normalized_family(selection)
     if family == "endpoint":
-        base = endpoint_base(str(selection.model or ""))
+        safe_url, url_secret = split_endpoint_credentials(
+            str(selection.model or "")
+        )
+        base = endpoint_base(safe_url)
+        # With REJECT_ENDPOINT_CREDENTIALS disabled the caller keeps userinfo or
+        # a credential query in the live URL and expects the request to use it;
+        # the patch stays credential-free.  Split it out here so the key reaches
+        # selection_env/the forwarded header instead of being silently dropped.
         return {
             "family": family,
             "base_url": base,
-            "api_key": selection.api_key or _env(AGENT_MODEL_API_KEY_ENV),
+            "api_key": (
+                selection.api_key
+                or _env(AGENT_MODEL_API_KEY_ENV)
+                or url_secret
+            ),
             "api_key_env": AGENT_MODEL_API_KEY_ENV,
             "model": selection.effective_model_id() or "default",
             "context_window": _int_env(
@@ -2468,7 +2540,11 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
     }
 
 
-def selection_env(selection: Optional[AgentSelection]) -> Dict[str, str]:
+def selection_env(
+    selection: Optional[AgentSelection],
+    *,
+    endpoint_api_key_env: Optional[str] = None,
+) -> Dict[str, str]:
     """Credential environment needed by the selected provider.
 
     Values are injected into the child process only; they are never written to
@@ -2477,9 +2553,14 @@ def selection_env(selection: Optional[AgentSelection]) -> Dict[str, str]:
     explicit reasoning-effort override is carried too, so a nested adapter that
     is handed this environment cannot fall back to the catalog default.
 
+    ``endpoint_api_key_env`` must be the same name a caller passed to
+    :func:`dsh_patch_text`; otherwise the generated provider config would read a
+    variable this function never exports.
+
     Example:
         A Dots selection returns ``DOTS_API_KEY`` and the compaction key variable
-        when configured.
+        when configured.  An endpoint selection whose patch uses
+        ``endpoint_api_key_env="OTHER_KEY"`` exports ``OTHER_KEY``.
 
     Counterexample:
         These values are child-process environment only; never persist this dict in
@@ -2498,7 +2579,7 @@ def selection_env(selection: Optional[AgentSelection]) -> Dict[str, str]:
     family = settings["family"]
     if family == "endpoint":
         key = settings["api_key"] or "dummy"
-        env[AGENT_MODEL_API_KEY_ENV] = key
+        env[endpoint_api_key_env or AGENT_MODEL_API_KEY_ENV] = key
     elif family == "deepseek":
         if settings["api_key"]:
             env.setdefault("DEEPSEEK_API_KEY", str(settings["api_key"]))
@@ -2668,6 +2749,9 @@ def dsh_patch_text(
     provider-only override has no profile model id available here, and a patch layer replaces
     the whole entry config, so it must not pin the sentinel as the provider's model either.
 
+    ``endpoint_api_key_env`` is the ``apiKeyEnv`` the generated endpoint patch reads; a caller
+    that uses it must pass the same name to :func:`selection_env`.
+
     Example:
         A Dots selection returns the ``llm-pi-ai`` provider patch plus the
         compaction route.
@@ -2776,15 +2860,15 @@ def dsh_patch_text(
             "%s"
             )
             % (
-                provider,
-                endpoint_api_key_env or AGENT_MODEL_API_KEY_ENV,
+                _yaml_scalar(provider),
+                _yaml_scalar(endpoint_api_key_env or AGENT_MODEL_API_KEY_ENV),
                 json.dumps(base_url),
                 json.dumps(model_name),
                 json.dumps(model_name),
                 context_window,
                 max_tokens,
                 effort_declaration,
-                provider,
+                _yaml_scalar(provider),
                 json.dumps(model_name),
                 effort_line,
             )
@@ -2832,14 +2916,14 @@ def dsh_patch_text(
             "    reasoningEffort: %s\n"
             )
             % (
-                provider,
+                _yaml_scalar(provider),
                 json.dumps("Qwen vLLM (%s)" % model),
-                settings["api_key_env"],
+                _yaml_scalar(settings["api_key_env"]),
                 json.dumps(base_url),
                 json.dumps(model),
                 context_window,
                 max_tokens,
-                provider,
+                _yaml_scalar(provider),
                 json.dumps(model),
                 json.dumps(
                     normalize_reasoning_effort(
@@ -3305,7 +3389,12 @@ def effective_agent_model(cmd: Sequence[Any]) -> Dict[str, Any]:
     }
 
 
-def redact_prep_object(value: Any) -> Any:
+def redact_prep_object(
+    value: Any,
+    *,
+    _seen: Optional[set] = None,
+    _depth: int = 0,
+) -> Any:
     """Recursively mask credential-looking *values* in a prep-json object.
 
     Request defaults such as ``max_tokens`` or ``max_completion_tokens`` are
@@ -3317,19 +3406,46 @@ def redact_prep_object(value: Any) -> Any:
 
     Counterexample:
         A non-secret key such as ``max_tokens`` stays readable; do not redact whole
-        request objects.
+        request objects.  A cyclic container is reported as ``"[CYCLE]"`` and a
+        container deeper than the guard as ``"[TRUNCATED]"`` instead of raising
+        ``RecursionError``.
     """
-    if isinstance(value, dict):
-        result = {}
-        for key, item in value.items():
-            if _credential_key(key):
-                # A secret-named key masks its whole value, whatever its type: a
-                # list/dict under `api_key` used to lose the key context when the
-                # recursion descended into it and returned the credential unchanged.
-                result[str(key)] = "[REDACTED]"
-            else:
-                result[str(key)] = redact_prep_object(item)
-        return result
-    if isinstance(value, list):
-        return [redact_prep_object(item) for item in value]
+    # A prep JSON object is caller-supplied and may be adversarial: a
+    # self-reference used to turn ``repr(selection)`` (a log/error path) into a
+    # RecursionError, and a ~2000-deep object does the same.  Track the current
+    # path so a shared (DAG) sub-object is not mistaken for a cycle.
+    if _depth > 64:
+        return "[TRUNCATED]"
+    seen = _seen if _seen is not None else set()
+    if isinstance(value, (dict, list, tuple)):
+        marker = id(value)
+        if marker in seen:
+            return "[CYCLE]"
+        seen.add(marker)
+        try:
+            if isinstance(value, dict):
+                result = {}
+                for key, item in value.items():
+                    if _credential_key(key):
+                        # A secret-named key masks its whole value, whatever its
+                        # type: a list/dict under `api_key` used to lose the key
+                        # context when the recursion descended into it and
+                        # returned the credential unchanged.
+                        result[str(key)] = "[REDACTED]"
+                    else:
+                        result[str(key)] = redact_prep_object(
+                            item, _seen=seen, _depth=_depth + 1
+                        )
+                return result
+            if isinstance(value, list):
+                return [
+                    redact_prep_object(item, _seen=seen, _depth=_depth + 1)
+                    for item in value
+                ]
+            return tuple(
+                redact_prep_object(item, _seen=seen, _depth=_depth + 1)
+                for item in value
+            )
+        finally:
+            seen.discard(marker)
     return value

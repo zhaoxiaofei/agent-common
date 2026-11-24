@@ -51,7 +51,9 @@ def completion_budget(
     regression fixtures do); in that case the output cap is the only limit.
     ``minimum`` is kept for callers that ask for a floor, but a floor larger
     than the usable limit cannot be met: the result is always capped at
-    ``min(output_cap, room)`` so it never overflows the context or the cap.
+    ``min(output_cap, room)`` so it never overflows the context or the cap.  A
+    negative ``reserve_tokens`` is treated as zero rather than adding room
+    beyond the declared context window.
 
     Example:
         With a 10,000-token window, a 16,000-token cap and a 1,000-character
@@ -66,11 +68,11 @@ def completion_budget(
     if not context:
         limit = cap
     else:
-        room = (
-            context
-            - estimated_prompt_tokens(prompt_chars)
-            - int(reserve_tokens)
-        )
+        # A negative reserve would add room beyond the declared context and
+        # break the "never overflows the window" promise; a bad configuration
+        # must not silently enlarge the answer budget.
+        reserve = max(0, int(reserve_tokens))
+        room = context - estimated_prompt_tokens(prompt_chars) - reserve
         if room <= 0:
             return 0
         limit = min(cap, room)

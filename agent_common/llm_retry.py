@@ -718,6 +718,92 @@ class _RetryProxyServer(http.server.ThreadingHTTPServer):
     allow_reuse_address = True
 
 
+#: Credential-looking query names, normalised like
+#: ``model_runtime._credential_key``.  This module deliberately stays
+#: standalone (no sibling import), so the predicate is mirrored here rather
+#: than importing model_runtime; the retry proxy must not accept a query
+#: credential the prep proxy rejects.
+_CREDENTIAL_QUERY_NAMES = frozenset(
+    {
+        "key",
+        "apikey",
+        "apikeys",
+        "xapikey",
+        "token",
+        "tokens",
+        "accesstoken",
+        "accesstokens",
+        "authtoken",
+        "authtokens",
+        "apitoken",
+        "apitokens",
+        "secret",
+        "secrets",
+        "secretkey",
+        "secretkeys",
+        "privatekey",
+        "privatekeys",
+        "clientsecret",
+        "clientsecrets",
+        "password",
+        "passwd",
+        "credential",
+        "credentials",
+        "authorization",
+        "auth",
+        "bearer",
+        "accesskey",
+        "accesskeys",
+        "accesskeyid",
+        "subscriptionkey",
+        "signature",
+        "signatures",
+        "sig",
+        "sigs",
+        "cookie",
+        "cookies",
+        "refreshtoken",
+        "refreshtokens",
+    }
+)
+_CREDENTIAL_QUERY_SUFFIXES = (
+    "_key",
+    "_token",
+    "_secret",
+    "_password",
+    "_passwd",
+    "_credential",
+    "_credentials",
+    "_authorization",
+    "_auth",
+    "_apikey",
+    "_signature",
+    "_sig",
+    "_cookie",
+)
+
+
+def _credential_query_key(name: Any) -> bool:
+    text = str(name or "").strip().lower()
+    compact = "".join(character for character in text if character.isalnum())
+    if compact in _CREDENTIAL_QUERY_NAMES:
+        return True
+    normalized = text.replace("-", "_").replace(" ", "_")
+    return normalized.endswith(_CREDENTIAL_QUERY_SUFFIXES)
+
+
+def _query_carries_credential(query: str) -> bool:
+    """Whether an upstream base query contains a credential-named parameter."""
+    if not query:
+        return False
+    try:
+        pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+    except ValueError:
+        # A query too malformed to inspect is not safe to forward verbatim.
+        return True
+    return any(_credential_query_key(key) for key, _value in pairs)
+
+
 class RetryProxy:
     """A loopback HTTP proxy that retries each upstream LLM call.
 
@@ -762,6 +848,15 @@ class RetryProxy:
             )
         if parsed.fragment:
             raise ValueError("upstream_base must not carry a URL fragment")
+        if _query_carries_credential(parsed.query):
+            # The sibling prep proxy rejects the same target; accepting it here
+            # stored the secret on the public ``upstream_base`` and appended it
+            # to every forwarded request, contradicting the class docstring.
+            raise ValueError(
+                "upstream_base must not carry a credential query parameter; "
+                "pass the credential in the forwarded Authorization header "
+                "instead"
+            )
         self._scheme = parsed.scheme
         self._host = parsed.hostname
         self._port = parsed.port
@@ -919,6 +1014,10 @@ class RetryProxy:
         self._server = None
         self._thread = None
         self.base_url = ""
+        # A direct ``proxy.stop()`` is documented; leaving the dead object and
+        # its base alias in the process-wide registry made len/contains report
+        # a stopped proxy until some later registry-based stop.
+        _PROXY_REGISTRY.remove(self)
         if server is not None:
             try:
                 server.shutdown()
@@ -955,6 +1054,7 @@ def retry_policy_yaml(policy: Optional[Mapping[str, Any]] = None, indent: str = 
 
     The block implements per-LLM-call retries on the agent loop's
     ``agent/request-error`` hook; it does not restart the harness or the stage.
+    A partial policy is filled from ``DEFAULT_POLICY`` before rendering.
 
     Example:
         ``retry_policy_yaml(policy, "  ")`` emits a ``retryPolicy:`` block with
@@ -964,7 +1064,7 @@ def retry_policy_yaml(policy: Optional[Mapping[str, Any]] = None, indent: str = 
         It returns YAML text, not a dict; do not pass it to a YAML merge function
         as structured data.
     """
-    document = dict(policy or load_policy())
+    document = _merge_policy(policy or load_policy())
     retry = document["retry"]
     lines = [
         "%sretryPolicy:" % indent,
@@ -973,7 +1073,9 @@ def retry_policy_yaml(policy: Optional[Mapping[str, Any]] = None, indent: str = 
         "%s  retryableCodes:" % indent,
     ]
     for code in retry["retryable_error_codes"]:
-        lines.append("%s    - %s" % (indent, code))
+        # The scalar emitter quotes and escapes a code containing a colon,
+        # newline or YAML boolean spelling so it cannot change the document shape.
+        lines.append("%s    - %s" % (indent, _yaml_scalar(code)))
     lines += [
         "%s  backoff:" % indent,
         "%s    initialDelayMs: %d"
@@ -993,10 +1095,11 @@ def dots_compaction(policy: Optional[Mapping[str, Any]] = None) -> Dict[str, Any
         ``"DOTS_API_KEY_1474"`` in the default policy.
 
     Counterexample:
-        It returns a shallow copy of the ``dots`` section; mutating nested values
-        can still affect the cached policy.
+        The returned dict is a deep copy with absent fields filled from
+        ``DEFAULT_POLICY``; do not assume it contains only the keys the caller
+        passed.
     """
-    return dict((policy or load_policy())["dots"])
+    return dict(_merge_policy(policy or load_policy())["dots"])
 
 
 def compaction_basic_yaml(
@@ -1006,6 +1109,8 @@ def compaction_basic_yaml(
 ) -> str:
     """The DSH ``compaction-basic`` entry that routes summarization.
 
+    A partial policy is filled from ``DEFAULT_POLICY`` before rendering.
+
     Example:
         ``compaction_basic_yaml(policy, "", "dots3-note-prev")`` emits the
         ``compaction-basic`` DSH entry.
@@ -1014,7 +1119,7 @@ def compaction_basic_yaml(
         An empty ``model`` emits an empty ``summarizationModel``; pass the real
         provider model id.
     """
-    document = dict(policy or load_policy())
+    document = _merge_policy(policy or load_policy())
     dots = document["dots"]
     compaction = document["compaction"]
     return (
@@ -1029,7 +1134,7 @@ def compaction_basic_yaml(
             indent,
             indent,
             indent,
-            dots["compaction_provider"],
+            _yaml_scalar(dots["compaction_provider"]),
             indent,
             json.dumps(model),
             indent,
@@ -1057,6 +1162,53 @@ _DOTS_THINKING_EFFORTS: Tuple[str, ...] = (
 )
 _DOTS_THINKING_OFF = frozenset({"", "0", "false", "no", "none", "off"})
 DOTS_WIRE_EFFORT = "max"
+
+
+#: Scalar spellings YAML 1.1/1.2 would read as a boolean or null instead of a
+#: string.  Such a value must be quoted even though it looks like a plain id.
+_YAML_AMBIGUOUS_SCALARS = frozenset(
+    {
+        "true",
+        "false",
+        "yes",
+        "no",
+        "on",
+        "off",
+        "y",
+        "n",
+        "null",
+        "none",
+        "~",
+        "inf",
+        "nan",
+    }
+)
+
+
+def _yaml_scalar(value: Any) -> str:
+    """Render a generated scalar as plain YAML when that is unambiguous.
+
+    Provider ids and key-env names are normally plain identifiers; keeping
+    those unquoted preserves the generated patch exactly.  A value containing a
+    colon, newline, comment marker, leading punctuation or a YAML
+    boolean/number spelling is JSON-quoted so it cannot change the document
+    structure.
+    """
+    text = str(value)
+    plain = (
+        bool(text)
+        and (text[0].isalpha() or text[0] == "_")
+        and all(
+            character.isalnum() or character in "_.-/" for character in text
+        )
+        and text.lower() not in _YAML_AMBIGUOUS_SCALARS
+    )
+    if plain:
+        try:
+            float(text)
+        except ValueError:
+            return text
+    return json.dumps(text)
 
 
 def _overlay_base_url(value: Any) -> str:
@@ -1141,7 +1293,7 @@ def dots_dsh_overlay(
         ``reasoningEfforts: false``: summarization spends its budget on the
         summary, not on a reasoning trace.
     """
-    document = dict(policy or load_policy())
+    document = _merge_policy(policy or load_policy())
     dots = document["dots"]
     compaction = document["compaction"]
     # The overlay is a persisted artifact: a direct caller's credential-bearing
@@ -1169,10 +1321,10 @@ def dots_dsh_overlay(
         "- id: llm-pi-ai",
         "  config:",
         "    providers:",
-        "      %s:" % provider,
+        "      %s:" % _yaml_scalar(provider),
         "        displayName: %s" % json.dumps("Dots API (%s)" % model),
         "        apiKeyEnv: %s"
-        % (
+        % _yaml_scalar(
             regular_api_key_env
             or dots.get("regular_api_key_env", "DOTS_API_KEY")
         ),
@@ -1198,10 +1350,10 @@ def dots_dsh_overlay(
     ]
     lines.extend(retry_policy_yaml(document, "        ").rstrip("\n").splitlines())
     lines += [
-        "      %s:" % dots["compaction_provider"],
+        "      %s:" % _yaml_scalar(dots["compaction_provider"]),
         "        displayName: %s"
         % json.dumps(dots.get("compaction_provider_label", "Dots compaction")),
-        "        apiKeyEnv: %s" % dots["compaction_api_key_env"],
+        "        apiKeyEnv: %s" % _yaml_scalar(dots["compaction_api_key_env"]),
         "        api: openai-completions",
         "        baseURL: %s" % json.dumps(compaction_base),
         "        streamIdleTimeoutMs: %d" % idle,
@@ -1223,7 +1375,7 @@ def dots_dsh_overlay(
     lines += [
         "- id: agent-default-model",
         "  config:",
-        "    provider: %s" % provider,
+        "    provider: %s" % _yaml_scalar(provider),
         "    model: %s" % json.dumps(model),
     ]
     if thinking:

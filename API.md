@@ -40,7 +40,7 @@ Key entry points:
 | `dsh_patch_text` | Generate the DSH `--patch` overlay for the selection. |
 | `codex_provider_args` | Generate `codex exec -c` provider overrides. |
 | `claude_environment` / `claude_model_arg` | Point Claude Code at the selected provider. |
-| `selection_env` | Child-process credential environment (never persisted). |
+| `selection_env` | Child-process credential environment (never persisted); pass the same `endpoint_api_key_env` given to `dsh_patch_text`. |
 | `effective_agent_model` / `AgentSelection.to_record` | Secret-free run record. |
 | `default_reasoning_level` | The catalog default level for a named model (`None` when the model keeps its own default). |
 | `model_fact` | One catalog fact (context window, caps, default level) for a named model; the way a consumer reads a shared setting. |
