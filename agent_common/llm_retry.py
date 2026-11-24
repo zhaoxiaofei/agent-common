@@ -1059,6 +1059,45 @@ _DOTS_THINKING_OFF = frozenset({"", "0", "false", "no", "none", "off"})
 DOTS_WIRE_EFFORT = "max"
 
 
+def _overlay_base_url(value: Any) -> str:
+    """A persisted base URL with userinfo, query and fragment removed.
+
+    ``dots_dsh_overlay`` is a public generator, so a direct caller can pass a
+    credential-bearing ``PAPER_*_BASE_URL``-shaped value.  The generated
+    ``dsh_model_patch.yml`` is agent-readable; keep the live credential out of
+    it, matching ``model_runtime.endpoint_base``.  This module stays standalone
+    (no sibling import), so the normalisation is local.
+    """
+    text = str(value or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(text)
+    except ValueError:
+        parsed = None
+    if parsed is not None and parsed.netloc:
+        netloc = parsed.netloc.rsplit("@", 1)[-1]
+        path = parsed.path.rstrip("/")
+        if path.endswith("/chat/completions"):
+            path = path[: -len("/chat/completions")].rstrip("/")
+        return urllib.parse.urlunsplit((parsed.scheme, netloc, path, "", ""))
+    # A host-less or unparsable value still may carry userinfo/query text;
+    # strip those parts textually rather than copying the secret.  The
+    # userinfo always lives in the authority before the first "/", whether or
+    # not a scheme is present, so a bare "user:pw@host/v1" is scrubbed too.
+    without_fragment = text.split("#", 1)[0]
+    before_query = without_fragment.split("?", 1)[0]
+    prefix = ""
+    remainder = before_query
+    if "://" in remainder:
+        scheme, _, remainder = remainder.partition("://")
+        prefix = scheme + "://"
+    elif remainder.startswith("//"):
+        prefix = "//"
+        remainder = remainder[2:]
+    authority, separator, tail = remainder.partition("/")
+    authority = authority.rsplit("@", 1)[-1]
+    return (prefix + authority + separator + tail).rstrip("/")
+
+
 def dots_dsh_overlay(
     policy: Optional[Mapping[str, Any]] = None,
     *,
@@ -1105,7 +1144,11 @@ def dots_dsh_overlay(
     document = dict(policy or load_policy())
     dots = document["dots"]
     compaction = document["compaction"]
-    compaction_base = str(compaction_base_url or base_url).rstrip("/")
+    # The overlay is a persisted artifact: a direct caller's credential-bearing
+    # base URL must not reach baseURL:.  The internal dsh_patch_text path
+    # already normalises it, but the public generator must protect itself.
+    base_url = _overlay_base_url(base_url)
+    compaction_base = _overlay_base_url(compaction_base_url or base_url)
     effort = str(reasoning_effort or "high").strip().lower()
     thinking = effort not in _DOTS_THINKING_OFF
     if thinking and effort not in _DOTS_THINKING_EFFORTS:

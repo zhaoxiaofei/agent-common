@@ -98,7 +98,7 @@ def main() -> int:
             print("FAIL %s" % problem)
         return 1
     try:
-        _llm_retry._merge_policy(document)
+        merged_policy = _llm_retry._merge_policy(document)
     except (TypeError, ValueError, OverflowError) as exc:
         problems.append("the runtime rejects this policy: %s" % exc)
         # The derived schedule below reads the same unvalidated values; a
@@ -106,7 +106,10 @@ def main() -> int:
         for problem in problems:
             print("FAIL %s" % problem)
         return 1
-    retry = document.get("retry")
+    # Derive the schedule from the merged policy: the runtime treats a null
+    # field as absent and fills it from the defaults, so reading the raw
+    # document here used to crash int()/float() on a policy the runtime accepts.
+    retry = merged_policy.get("retry")
     if not isinstance(retry, Mapping):
         retry = {}
     expected = [10, 20, 40, 80, 160, 320, 640, 1280, 2560, 3600]

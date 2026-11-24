@@ -42,7 +42,9 @@ def parse_event(line: Any) -> Optional[dict]:
         return None
     try:
         event = json.loads(text)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # A deeply nested line makes the decoder raise RecursionError, which is
+        # not a ValueError; a malformed line is still "not an event".
         return None
     return event if isinstance(event, dict) else None
 
