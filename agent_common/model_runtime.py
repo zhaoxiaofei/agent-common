@@ -647,9 +647,15 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
                     )
                 update["chat_max_tokens"] = chat_max_tokens
             default_level = facts.get("default_reasoning_level")
-            if default_level:
-                default_level = str(default_level)
-                if default_level not in _CATALOG_DEFAULT_LEVELS:
+            # Only a missing/None field is absent.  A present but falsy value
+            # (``[]``, ``0``, ``False``, ``{}``) was silently dropped here while
+            # check_model_catalog rejected it, leaving the model on a hard-coded
+            # fallback instead of failing the atomic reload.
+            if default_level is not None:
+                if (
+                    not isinstance(default_level, str)
+                    or default_level not in _CATALOG_DEFAULT_LEVELS
+                ):
                     raise ConfigError(
                         "model %r: default_reasoning_level %r is not one of %s "
                         "in %s"
@@ -664,8 +670,20 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
             # The catalog is also the one source for the provider route: the
             # runtime used to keep separate QWEN_/DOTS_ base-URL and key-env
             # literals that a catalog edit could not reach.
-            if facts.get("provider"):
-                update["dsh_provider"] = str(facts["provider"])
+            # Only a missing/None field is absent.  A present but falsy value
+            # (``[]``, ``0``, ``""``) was silently dropped by a truthiness
+            # guard, leaving the model on a hard-coded fallback provider.
+            if "provider" in facts and facts["provider"] is not None:
+                provider = facts["provider"]
+                # A list/dict provider used to become its repr and reach the
+                # generated patch as a bogus provider id.  The catalog is the
+                # routing source of truth, so reject it on reload.
+                if not isinstance(provider, str) or not provider.strip():
+                    raise ConfigError(
+                        "model %r: provider %r must be a non-empty string in %s"
+                        % (name, provider, _MODEL_CATALOG_PATH)
+                    )
+                update["dsh_provider"] = provider
             if facts.get("base_url"):
                 # The catalog is a shared, agent-readable artifact.  Keep the
                 # public table and the exported constants credential-free and
@@ -688,8 +706,16 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
                 update["base_url"] = safe_base
                 if base_secret:
                     base_secrets[name] = base_secret
-            if facts.get("api_key_env"):
-                update["api_key_env"] = str(facts["api_key_env"])
+            if "api_key_env" in facts and facts["api_key_env"] is not None:
+                key_env = facts["api_key_env"]
+                # 123 used to become the environment variable name "123";
+                # a non-string key env cannot name a usable credential source.
+                if not isinstance(key_env, str) or not key_env.strip():
+                    raise ConfigError(
+                        "model %r: api_key_env %r must be a non-empty string in %s"
+                        % (name, key_env, _MODEL_CATALOG_PATH)
+                    )
+                update["api_key_env"] = key_env
             pending[name] = update
             # A field the previous catalog supplied must disappear when the new
             # catalog omits it; an overlay would otherwise leave it stale and
@@ -1482,8 +1508,18 @@ class AgentSelection:
             return None
         return str((AGENT_MODELS.get(self.model) or {}).get("id") or self.model)
 
-    def to_record(self, raw_model: Optional[str] = None) -> Dict[str, Any]:
+    def to_record(
+        self,
+        raw_model: Optional[str] = None,
+        *,
+        endpoint_api_key_env: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Secret-free shape for ``command.json`` / ``status.json``.
+
+        ``endpoint_api_key_env`` is the same optional variable name a caller
+        passes to :func:`selection_env` / :func:`dsh_patch_text`; it lets the
+        record report a credential that lives only in that caller-named
+        variable.
 
         Example:
             The record contains ``harness``, ``model``, ``id`` and ``api_key_set`` and
@@ -1498,6 +1534,29 @@ class AgentSelection:
         # as a URL must not smuggle userinfo/query credentials into the record.
         record_model_name = _redacted_endpoint_text(self.model_name)
         record_id = _redacted_endpoint_text(self.effective_model_id(raw_model))
+        # Report the credential the live request will actually use: an
+        # explicit key, the endpoint's key environment (default or the
+        # caller-named one), or a URL userinfo/query secret.  Checking only
+        # ``api_key``/the default variable hid the URL credential.  A
+        # sentinel/None selection can take its endpoint from ``--model``
+        # (``dsh_patch_text`` builds the live block from exactly that shape),
+        # so resolve the same effective endpoint before checking.
+        effective_endpoint = None
+        if self.is_endpoint:
+            effective_endpoint = str(self.model)
+        elif raw_model and agent_model_is_endpoint(str(raw_model)):
+            effective_endpoint = str(raw_model)
+        api_key_set = bool(self.api_key)
+        if not api_key_set and effective_endpoint is not None:
+            key_env_names = [AGENT_MODEL_API_KEY_ENV]
+            if endpoint_api_key_env:
+                key_env_names.append(endpoint_api_key_env)
+            api_key_set = any(_env(name) for name in key_env_names)
+            if not api_key_set:
+                _safe_url, url_secret = split_endpoint_credentials(
+                    effective_endpoint
+                )
+                api_key_set = bool(url_secret)
         return {
             "harness": self.harness,
             "model": record_model,
@@ -1511,13 +1570,7 @@ class AgentSelection:
             if self.is_endpoint and record_model is not None
             else None,
             "model_name": record_model_name if self.is_endpoint else None,
-            "api_key_set": bool(
-                self.api_key
-                or (
-                    self.is_endpoint
-                    and _env(AGENT_MODEL_API_KEY_ENV)
-                )
-            ),
+            "api_key_set": api_key_set,
             "prep_keys": sorted(str(key) for key in self.prep_json),
         }
 
@@ -1853,6 +1906,31 @@ def _endpoint_context(entries: Sequence[Mapping[str, Any]], model: str) -> Optio
     return None
 
 
+def _endpoint_request_key(
+    selection: AgentSelection, api_key: Optional[str] = None
+) -> str:
+    """The credential the live endpoint request would send.
+
+    Keep this in one place: the ``/models`` preflight must authenticate with
+    exactly the key the request uses.  An explicit key wins, then the
+    selection's key, then the default key environment, then a credential
+    carried by the URL (accepted when ``REJECT_ENDPOINT_CREDENTIALS`` is off).
+    The URL secret was already extracted by ``_provider_family_settings`` for
+    the live route but was omitted from the preflight.
+    """
+    if api_key:
+        return str(api_key)
+    if selection.api_key:
+        return str(selection.api_key)
+    env_key = _env(AGENT_MODEL_API_KEY_ENV)
+    if env_key:
+        return env_key
+    _safe_url, url_secret = split_endpoint_credentials(
+        str(selection.model or "")
+    )
+    return url_secret
+
+
 def resolve_endpoint_model(
     selection: AgentSelection, *, probe: bool = True, api_key: Optional[str] = None
 ) -> Tuple[str, Optional[int], str]:
@@ -1877,7 +1955,7 @@ def resolve_endpoint_model(
     if selection.model_name:
         if not probe:
             return selection.model_name, None, ""
-        key = api_key or selection.api_key or _env(AGENT_MODEL_API_KEY_ENV)
+        key = _endpoint_request_key(selection, api_key)
         try:
             entries = _endpoint_catalog(
                 endpoint_base(str(selection.model or "")), key
@@ -1892,12 +1970,15 @@ def resolve_endpoint_model(
         return query_model, None, ""
     if not probe:
         return "default", None, ""
-    key = api_key or selection.api_key or _env(AGENT_MODEL_API_KEY_ENV)
+    key = _endpoint_request_key(selection, api_key)
     try:
         entries = _endpoint_catalog(endpoint_base(str(selection.model or "")), key)
     except _EndpointProbeError as exc:
         return "", None, str(exc)
-    models = [str(entry.get("id")) for entry in entries]
+    # A listing that repeats one id names one model, not an ambiguity.  Keep
+    # the first-seen order so the error message (when there really are several)
+    # stays deterministic.
+    models = list(dict.fromkeys(str(entry.get("id")) for entry in entries))
     if len(models) == 1:
         return models[0], _endpoint_context(entries, models[0]), ""
     if len(models) > 1:
@@ -1966,6 +2047,18 @@ def parse_prep_json(value: Any) -> Dict[str, Any]:
     if value in (None, ""):
         return {}
     if isinstance(value, dict):
+        # A caller can pass the object directly, bypassing the string parser's
+        # guards.  Validate it with the same strict JSON contract (no NaN or
+        # Infinity, no non-serialisable/cyclic value) before accepting it; the
+        # value later goes through json.dumps for the live request.  Return the
+        # caller's data unchanged rather than round-tripping it, so a valid
+        # object keeps its exact types.
+        try:
+            json.dumps(value, allow_nan=False)
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ConfigError(
+                "--agent-model-prep-json is not valid JSON: %s" % exc
+            ) from None
         return dict(value)
     try:
         # The default decoder accepts NaN/Infinity, which are not valid JSON
@@ -2578,8 +2671,14 @@ def selection_env(
     settings = _provider_family_settings(selection)
     family = settings["family"]
     if family == "endpoint":
-        key = settings["api_key"] or "dummy"
-        env[endpoint_api_key_env or AGENT_MODEL_API_KEY_ENV] = key
+        # The caller named the variable the generated patch reads.  A real key
+        # may already live only in that variable (``OTHER_KEY=K``), so read it
+        # before falling back to the local-route dummy; overwriting it with
+        # "dummy" silently dropped the credential.
+        key = settings["api_key"]
+        if not key and endpoint_api_key_env:
+            key = _env(endpoint_api_key_env)
+        env[endpoint_api_key_env or AGENT_MODEL_API_KEY_ENV] = key or "dummy"
     elif family == "deepseek":
         if settings["api_key"]:
             env.setdefault("DEEPSEEK_API_KEY", str(settings["api_key"]))
@@ -2766,6 +2865,7 @@ def dsh_patch_text(
     settings = _provider_family_settings(selection)
     family = settings["family"]
     raw_info: Dict[str, Any] = {}
+    raw_endpoint = bool(raw_model) and agent_model_is_endpoint(str(raw_model))
     if (selection.is_default or selection.model is None) and raw_model:
         # The sentinel/legacy shape has no catalog entry of its own, but a raw
         # model still names its family.  Resolve the family *before* the
@@ -2781,9 +2881,23 @@ def dsh_patch_text(
             )
             settings = _provider_family_settings(inferred)
             family = settings["family"]
+        elif raw_endpoint:
+            # An http(s) raw --model is a custom endpoint, not a provider model
+            # id.  Without this the final branch pointed DeepSeek at the URL
+            # and dropped the base URL entirely.
+            selection = AgentSelection(
+                harness=selection.harness,
+                model=str(raw_model),
+                api_key=selection.api_key,
+                prep_json=selection.prep_json,
+            )
+            settings = _provider_family_settings(selection)
+            family = settings["family"]
     if family == "endpoint":
+        # When the raw model *is* the endpoint URL, the provider model id must
+        # come from --agent-model-name/?model=/default, not from the URL.
         model_name = (
-            raw_model
+            (None if raw_endpoint else raw_model)
             or model_name_override
             or selection.model_name
             or endpoint_query_model(str(selection.model or ""))
@@ -2874,7 +2988,9 @@ def dsh_patch_text(
             )
         )
     if family == "qwen":
-        model = _redacted_endpoint_text(raw_model) or settings["model"]
+        model = _redacted_endpoint_text(raw_model) or _redacted_endpoint_text(
+            settings["model"]
+        )
         provider = provider_override or settings.get("provider") or "qwen"
         base_url = _normalized_patch_base_url(
             base_url_override or settings["base_url"]
@@ -2936,7 +3052,9 @@ def dsh_patch_text(
             )
         )
     if family == "dots":
-        model = _redacted_endpoint_text(raw_model) or settings["model"]
+        model = _redacted_endpoint_text(raw_model) or _redacted_endpoint_text(
+            settings["model"]
+        )
         base_url = _normalized_patch_base_url(
             base_url_override or settings["base_url"]
         )
@@ -3038,6 +3156,13 @@ def codex_provider_args(
     """
     if selection.model is None or selection.is_default:
         inferred = None
+        if raw_model and agent_model_is_endpoint(str(raw_model)):
+            # A custom endpoint cannot run on the Codex route.  Returning []
+            # here let Codex silently keep its own configured model; the named
+            # endpoint branch below already raises the same ConfigError.
+            raise ConfigError(
+                "a custom --agent-model endpoint cannot run on gpt-codex; use dsh"
+            )
         if raw_model:
             raw_info = AGENT_MODELS.get(normalize_agent_model(raw_model)) or {}
             if raw_info:
@@ -3062,6 +3187,11 @@ def codex_provider_args(
         selection = inferred
     settings = _provider_family_settings(selection)
     family = settings["family"]
+    if family == "claude" and raw_model:
+        # Codex has no Claude builder.  Silently returning [] meant the
+        # operator's raw model never reached the child and no record showed the
+        # mismatch; make the unsupported pair explicit.
+        raise ConfigError("a Claude model cannot run on gpt-codex; use claude-code")
     # The argv is world-readable, so a credential-bearing URL must never be
     # emitted verbatim; the DSH route already redacts the same raw_model.
     model = (
@@ -3179,11 +3309,14 @@ def claude_model_arg(
         ``None`` means "let Claude Code use its configured model"; it is not an
         error.
     """
-    if selection.model is None or selection.is_default:
-        return None
     # A raw model may be a credentialed endpoint URL; the child argv is
     # world-readable, so keep only the credential-free shape.
     raw = _redacted_endpoint_text(raw_model)
+    if selection.model is None or selection.is_default:
+        # A config-owned selection still honours an explicit --model override;
+        # returning early here silently dropped it on the Claude route while
+        # dsh/codex already honoured it.
+        return str(raw) if raw else None
     family = _normalized_family(selection)
     if family == "claude":
         info = selection.model_info()
@@ -3227,12 +3360,31 @@ def claude_environment(
         A GPT/Claude/endpoint selection returns ``{}``; the function does not
         invent an Anthropic route for an unsupported family.
     """
-    if selection is None or selection.model is None or selection.is_default:
-        # The CLI owns the model, but an explicit level still reaches Claude
-        # Code.  Translate it to Claude Code's vocabulary: minimal/xhigh are
-        # not levels it accepts and an ``off`` override emits nothing.
+    if selection is None:
+        # Preserve the documented "carry an explicit override even with no
+        # selection" behaviour.
         effort = _claude_code_effort(reasoning_effort_override())
         return {"CLAUDE_CODE_EFFORT_LEVEL": effort} if effort else {}
+    if selection.model is None or selection.is_default:
+        # The sentinel/legacy shape still honours a raw catalog model: build
+        # the same inferred selection dsh_patch_text/codex_provider_args use,
+        # so a raw qwen/dots model gets its Anthropic route.  Without a catalog
+        # entry the CLI owns the model, but an explicit level still reaches
+        # Claude Code.
+        inferred = None
+        if raw_model:
+            raw_info = AGENT_MODELS.get(normalize_agent_model(raw_model)) or {}
+            if raw_info:
+                inferred = AgentSelection(
+                    harness=selection.harness,
+                    model=normalize_agent_model(raw_model),
+                    api_key=selection.api_key,
+                    prep_json=selection.prep_json,
+                )
+        if inferred is None:
+            effort = _claude_code_effort(reasoning_effort_override())
+            return {"CLAUDE_CODE_EFFORT_LEVEL": effort} if effort else {}
+        selection = inferred
     settings = _provider_family_settings(selection)
     family = settings["family"]
     if family in ("claude", "gpt"):
@@ -3252,7 +3404,10 @@ def claude_environment(
     key = str(settings["api_key"] or "")
     if family == "qwen":
         key = key or "dummy"
-    model = str(_redacted_endpoint_text(raw_model) or settings["model"])
+    model = str(
+        _redacted_endpoint_text(raw_model)
+        or _redacted_endpoint_text(settings["model"])
+    )
     if family == "deepseek":
         primary = str(_redacted_endpoint_text(raw_model) or "deepseek-flash[1m]")
         small = str(_redacted_endpoint_text(raw_model) or "deepseek-flash")
@@ -3424,6 +3579,23 @@ def redact_prep_object(
         seen.add(marker)
         try:
             if isinstance(value, dict):
+                # A header pair names its credential in the sibling ``name``
+                # field (``{"name": "Authorization", "value": "Bearer ..."}``);
+                # the ``value`` key itself does not look like a credential, so
+                # it used to be printed verbatim.
+                header_name = value.get("name")
+                if "value" in value and header_name is not None and _credential_key(
+                    header_name
+                ):
+                    pair = {}
+                    for key, item in value.items():
+                        if str(key).lower() == "value":
+                            pair[str(key)] = "[REDACTED]"
+                        else:
+                            pair[str(key)] = redact_prep_object(
+                                item, _seen=seen, _depth=_depth + 1
+                            )
+                    return pair
                 result = {}
                 for key, item in value.items():
                     if _credential_key(key):
@@ -3448,4 +3620,8 @@ def redact_prep_object(
             )
         finally:
             seen.discard(marker)
+    if isinstance(value, str):
+        # A URL-shaped or credential-bearing string value is a secret even
+        # under an ordinary key such as ``endpoint``/``base_url``; mask it.
+        return _redacted_endpoint_text(value)
     return value

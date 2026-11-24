@@ -15,6 +15,7 @@ paper-refine root.
 
 from __future__ import annotations
 
+import copy
 import email.utils
 import http.client
 import http.server
@@ -509,9 +510,16 @@ def retry_after_seconds(headers: Optional[Mapping[str, str]]) -> Optional[float]
     if not raw:
         return None
     try:
-        return max(0.0, float(raw))
+        seconds = float(raw)
     except ValueError:
         pass
+    else:
+        # The docstring contract: an invalid header means "no provider hint".
+        # max(0.0, ...) turned a negative or NaN value into a false zero-delay
+        # hint, which callers may then hot-loop on.
+        if not math.isfinite(seconds) or seconds < 0:
+            return None
+        return seconds
     try:
         parsed = email.utils.parsedate_to_datetime(raw)
     except (TypeError, ValueError):
@@ -857,9 +865,20 @@ class RetryProxy:
                 "pass the credential in the forwarded Authorization header "
                 "instead"
             )
+        try:
+            # ``parsed.port`` raises ValueError for an out-of-range port; keep
+            # the dedicated message so a bad target fails at construction time.
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("upstream_base has an invalid port: %s" % exc) from None
+        if port is not None and not 0 < port <= 65535:
+            # Port 0 is not a usable client port.  endpoint_base already
+            # rejects it; accepting it here delayed the failure to the first
+            # forwarded request, which cannot connect.
+            raise ValueError("upstream_base has an invalid port: %d" % port)
         self._scheme = parsed.scheme
         self._host = parsed.hostname
-        self._port = parsed.port
+        self._port = port
         self._prefix = parsed.path.rstrip("/")
         # A base URL may carry upstream parameters (for example
         # ``?api-version=2024``); every forwarded request keeps them.
@@ -1076,12 +1095,19 @@ def retry_policy_yaml(policy: Optional[Mapping[str, Any]] = None, indent: str = 
         # The scalar emitter quotes and escapes a code containing a colon,
         # newline or YAML boolean spelling so it cannot change the document shape.
         lines.append("%s    - %s" % (indent, _yaml_scalar(code)))
+    # A positive sub-millisecond delay truncated to 0 ms disables the backoff
+    # the policy explicitly asked for.  Round up, keeping at least 1 ms, and
+    # never emit a maximum below the initial delay.
+    initial_ms = max(
+        1, int(math.ceil(float(retry["initial_delay_seconds"]) * 1000))
+    )
+    max_ms = max(
+        initial_ms, int(math.ceil(float(retry["max_delay_seconds"]) * 1000))
+    )
     lines += [
         "%s  backoff:" % indent,
-        "%s    initialDelayMs: %d"
-        % (indent, int(float(retry["initial_delay_seconds"]) * 1000)),
-        "%s    maxDelayMs: %d"
-        % (indent, int(float(retry["max_delay_seconds"]) * 1000)),
+        "%s    initialDelayMs: %d" % (indent, initial_ms),
+        "%s    maxDelayMs: %d" % (indent, max_ms),
         "%s    jitterRatio: %s" % (indent, retry["jitter_ratio"]),
     ]
     return "\n".join(lines) + "\n"
@@ -1099,7 +1125,7 @@ def dots_compaction(policy: Optional[Mapping[str, Any]] = None) -> Dict[str, Any
         ``DEFAULT_POLICY``; do not assume it contains only the keys the caller
         passed.
     """
-    return dict(_merge_policy(policy or load_policy())["dots"])
+    return copy.deepcopy(_merge_policy(policy or load_policy())["dots"])
 
 
 def compaction_basic_yaml(
@@ -1301,7 +1327,9 @@ def dots_dsh_overlay(
     # already normalises it, but the public generator must protect itself.
     base_url = _overlay_base_url(base_url)
     compaction_base = _overlay_base_url(compaction_base_url or base_url)
-    effort = str(reasoning_effort or "high").strip().lower()
+    # Normalize first: a whitespace-only value is absent and must use the
+    # default, not strip to "" and match the thinking-off sentinel.
+    effort = str(reasoning_effort or "").strip().lower() or "high"
     thinking = effort not in _DOTS_THINKING_OFF
     if thinking and effort not in _DOTS_THINKING_EFFORTS:
         # The API has one thinking level, so an unrecognised non-off spelling

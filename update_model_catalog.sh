@@ -9,6 +9,7 @@ set -eu
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(dirname "$here")
 
+synced=0
 for repo in generic-debug-pipeline paper-refine paper-refine-eval; do
     checkout="$root/$repo"
     if [ ! -d "$checkout" ]; then
@@ -20,7 +21,13 @@ for repo in generic-debug-pipeline paper-refine paper-refine-eval; do
         continue
     fi
     git -C "$checkout" submodule update --init --recursive agent-common
+    synced=$((synced + 1))
     printf 'synced submodule %s/agent-common\n' "$checkout"
 done
 
-printf 'OK: agent-common submodule checked out; run check_model_catalog.py\n'
+if [ "$synced" -eq 0 ]; then
+    # A caller/CI job in a partial checkout used to see OK with nothing synced.
+    printf 'FAIL: no checkout was synced (all were skipped)\n' >&2
+    exit 1
+fi
+printf 'OK: agent-common submodule checked out in %d checkout(s); run check_model_catalog.py\n' "$synced"

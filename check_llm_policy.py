@@ -137,11 +137,16 @@ def main() -> int:
 
     dots = document.get("dots")
     if not isinstance(dots, Mapping):
+        # Report the actual shape error.  Substituting {} here compared two
+        # missing values and told the operator the two key variables were the
+        # same, hiding the real cause.
+        problems.append("dots must be a mapping, got %r" % (dots,))
         dots = {}
-    if dots.get("regular_api_key_env") == dots.get("compaction_api_key_env"):
-        problems.append("regular and compaction Dots keys are the same variable")
-    if not dots.get("compaction_provider"):
-        problems.append("no dedicated compaction provider is declared")
+    else:
+        if dots.get("regular_api_key_env") == dots.get("compaction_api_key_env"):
+            problems.append("regular and compaction Dots keys are the same variable")
+        if not dots.get("compaction_provider"):
+            problems.append("no dedicated compaction provider is declared")
     # ``llm_retry.py`` documents DEFAULT_POLICY as the fallback to keep in sync
     # with this file; compare it (the metadata keys are intentionally absent).
     for section in ("retry", "dots", "compaction"):
@@ -185,7 +190,13 @@ def main() -> int:
             if (ROOT / "paper-refine").is_dir():
                 problems.append("missing adapter: %s" % adapter)
             continue
-        text = adapter.read_text(encoding="utf-8")
+        try:
+            text = adapter.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as exc:
+            # A binary or unreadable adapter is the malformed-repository case a
+            # checker must report as FAIL, not abort with a traceback.
+            problems.append("cannot read adapter %s: %s" % (adapter, exc))
+            continue
         if "import model_runtime as rt" not in text:
             problems.append("%s does not import the shared model runtime" % adapter)
         if name in ("paper_dots_agent.py", "paper_qwen_agent.py"):
