@@ -24,6 +24,7 @@ import contextlib
 import http.client
 import http.server
 import json
+import math
 import os
 import threading
 import urllib.error
@@ -321,15 +322,20 @@ def _carries_unparsed_credential(text: str) -> bool:
 
 
 def _redacted_endpoint_text(value: Optional[str]) -> Optional[str]:
-    """Redact a URL-shaped stored value, leaving a plain model id unchanged."""
+    """Redact a URL-shaped or otherwise credential-bearing value.
+
+    A plain model id is returned unchanged.
+    """
     if value is None:
         return None
     text = str(value)
-    url_shaped = "://" in text or text.startswith("//")
+    # A scheme is not required for a credential: a bare ``user:pw@host/v1``
+    # carries userinfo just as a URL-shaped value does, and a host-less value
+    # can still carry a credential query parameter.
     if (
         agent_model_is_endpoint(text)
         or endpoint_credentials(text)
-        or (url_shaped and _carries_unparsed_credential(text))
+        or _carries_unparsed_credential(text)
     ):
         return redact_endpoint_url(text)
     return value
@@ -507,6 +513,38 @@ def endpoint_credentials(url: str) -> str:
     return ""
 
 
+#: Levels a catalog may name as a model's default.  ``off`` is a per-run
+#: override, not a deployment default (``check_model_catalog`` pins the same
+#: vocabulary).  Defined before the import-time catalog load below, which
+#: cannot yet use ``REASONING_EFFORT_LEVELS`` declared later in the module.
+_CATALOG_DEFAULT_LEVELS = frozenset(
+    {"minimal", "low", "medium", "high", "xhigh", "max"}
+)
+
+
+def _stored_endpoint_problem(url: str) -> str:
+    """A short reason a catalog ``base_url`` is unusable, or ``""``.
+
+    Defined before the import-time catalog load; the public
+    :func:`endpoint_base` is declared later in this module and cannot be called
+    there yet.  Non-http and scheme-relative values remain importable: a
+    checkout may carry a legacy catalog value that the credential scrub must
+    still handle (see ``test_a_non_http_catalog_base_url_imports_credential_free``),
+    so only a value with no host or an invalid port is rejected here.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        return str(exc)
+    if not host:
+        return "not a URL with a host"
+    if port is not None and not 0 < port <= 65535:
+        return "invalid port %d" % port
+    return ""
+
+
 def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
     """Overwrite each model's facts from the shared catalog, atomically.
 
@@ -572,7 +610,19 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
                 update["chat_max_tokens"] = chat_max_tokens
             default_level = facts.get("default_reasoning_level")
             if default_level:
-                update["default_reasoning_level"] = str(default_level)
+                default_level = str(default_level)
+                if default_level not in _CATALOG_DEFAULT_LEVELS:
+                    raise ConfigError(
+                        "model %r: default_reasoning_level %r is not one of %s "
+                        "in %s"
+                        % (
+                            name,
+                            default_level,
+                            ", ".join(sorted(_CATALOG_DEFAULT_LEVELS)),
+                            _MODEL_CATALOG_PATH,
+                        )
+                    )
+                update["default_reasoning_level"] = default_level
             # The catalog is also the one source for the provider route: the
             # runtime used to keep separate QWEN_/DOTS_ base-URL and key-env
             # literals that a catalog edit could not reach.
@@ -585,6 +635,18 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
                 safe_base, base_secret = split_endpoint_credentials(
                     str(facts["base_url"])
                 )
+                try:
+                    # Validate the URL shape at load time; the DSH route fails
+                    # on a bad base only when a run is configured, while the
+                    # Claude route silently exported it to the child.
+                    problem = _stored_endpoint_problem(safe_base)
+                    if problem:
+                        raise ConfigError(problem)
+                except ConfigError as exc:
+                    raise ConfigError(
+                        "model %r: base_url in %s is not a usable endpoint: %s"
+                        % (name, _MODEL_CATALOG_PATH, exc)
+                    ) from None
                 update["base_url"] = safe_base
                 if base_secret:
                     base_secrets[name] = base_secret
@@ -619,7 +681,7 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
             "cannot read the shared model catalog %s: %s (copy it beside "
             "model_runtime.py)" % (_MODEL_CATALOG_PATH, exc)
         ) from exc
-    except (ValueError, KeyError, TypeError, RecursionError) as exc:
+    except (ValueError, KeyError, TypeError, OverflowError, RecursionError) as exc:
         raise ConfigError(
             "the shared model catalog %s is malformed: %s"
             % (_MODEL_CATALOG_PATH, exc)
@@ -1595,7 +1657,6 @@ def endpoint_base(url: str) -> str:
     try:
         parsed = urllib.parse.urlsplit(text)
         host = parsed.hostname
-        parsed.port          # a non-numeric or out-of-range port is malformed too
     except ValueError:
         raise ConfigError(
             "--agent-model endpoint %r is not an http(s) URL with a host" % safe
@@ -1605,6 +1666,9 @@ def endpoint_base(url: str) -> str:
             "--agent-model endpoint %r is not an http(s) URL with a host" % safe
         )
     try:
+        # ``parsed.port`` must stay outside the host-validation try above: its
+        # ValueError describes an invalid port, not a host-less URL, and used
+        # to make the dedicated branch below unreachable.
         port = parsed.port
     except ValueError as exc:
         raise ConfigError(
@@ -1818,6 +1882,19 @@ def deep_merge(base: Dict[str, Any], override: Mapping[str, Any]) -> Dict[str, A
     return base
 
 
+def _reject_json_constant(value: str) -> Any:
+    """Reject the NaN/Infinity spellings the JSON decoder accepts by default."""
+    raise ValueError("non-finite JSON number %s" % value)
+
+
+def _finite_json_float(value: str) -> float:
+    """Parse a JSON float, rejecting an exponent that overflows to infinity."""
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("non-finite JSON number %s" % value)
+    return number
+
+
 def parse_prep_json(value: Any) -> Dict[str, Any]:
     """A JSON object for ``--agent-model-prep-json`` (an empty value is ``{}``).
 
@@ -1834,7 +1911,13 @@ def parse_prep_json(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         return dict(value)
     try:
-        parsed = json.loads(str(value))
+        # The default decoder accepts NaN/Infinity, which are not valid JSON
+        # and would later be serialised into an invalid request body.
+        parsed = json.loads(
+            str(value),
+            parse_constant=_reject_json_constant,
+            parse_float=_finite_json_float,
+        )
     except (ValueError, RecursionError) as exc:
         raise ConfigError("--agent-model-prep-json is not valid JSON: %s" % exc) from None
     if not isinstance(parsed, dict):
@@ -2054,7 +2137,7 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
             if isinstance(payload, dict):
                 deep_merge(payload, prep)
                 try:
-                    body = json.dumps(payload).encode("utf-8")
+                    body = json.dumps(payload, allow_nan=False).encode("utf-8")
                 except (TypeError, ValueError) as exc:
                     self._send_error(
                         400, "prep object is not JSON-serialisable: %s" % exc
@@ -2104,7 +2187,8 @@ def start_prep_proxy(target_base: str, prep: Mapping[str, Any]) -> Tuple[str, st
     try:
         prep_object = dict(prep)
         # Fail at startup, not inside the first request's handler thread.
-        json.dumps(prep_object)
+        # allow_nan=False rejects a directly supplied NaN/Infinity too.
+        json.dumps(prep_object, allow_nan=False)
     except (TypeError, ValueError) as exc:
         return "", "prep object is not JSON-serialisable: %s" % exc
     try:
@@ -2282,7 +2366,10 @@ def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
             "max_tokens": _int_env(
                 "PAPER_AGENT_MAX_TOKENS", DEFAULT_ENDPOINT_MAX_TOKENS
             ),
-            "effort": None,
+            # A custom endpoint has no catalog default, but an explicit
+            # operator override still applies; normalize_reasoning_effort()
+            # passes a custom endpoint's level through unchanged.
+            "effort": override,
         }
     if family == "qwen":
         base_url, base_secret = _env_base_url(
@@ -2540,11 +2627,23 @@ def _normalized_route_base_url(value: Any) -> str:
     The Codex and Claude routes historically accepted the rstrip-only value and
     kept a ``/chat/completions`` suffix; normalize it here so all three routes
     agree, without turning a malformed legacy value into an exception.
+
+    A value that parses into a non-http(s) or scheme-relative URL with an
+    authority is not a malformed legacy form: neither route can use it, and
+    returning it would silently export an unusable base to the child, so it
+    raises the same ``ConfigError`` as :func:`endpoint_base`.
     """
     text = str(value or "")
     try:
         return endpoint_base(text)
     except ConfigError:
+        try:
+            parsed = urllib.parse.urlsplit(text)
+        except ValueError:
+            # Unparsable legacy forms (already credential-free) stay tolerated.
+            return text.rstrip("/")
+        if parsed.netloc and parsed.scheme not in ("http", "https"):
+            raise
         return text.rstrip("/")
 
 
@@ -2620,6 +2719,35 @@ def dsh_patch_text(
             DEFAULT_ENDPOINT_MAX_TOKENS,
         )
         provider = provider_override or "endpoint"
+        # A custom endpoint has no catalog default, so without an operator
+        # override the patch keeps effort selection off.  An explicit override
+        # (argument or environment) is passed through (the endpoint's harness
+        # validates the vocabulary), matching the documented "overrides every
+        # family" contract instead of carrying the level in the child
+        # environment while ignoring it here.
+        endpoint_effort = effort_override or settings["effort"]
+        if endpoint_effort:
+            effort_declaration = (
+                "            reasoningEfforts:\n"
+                # Quoted: an unquoted `off` is a YAML 1.1 boolean.
+                '              "off":\n'
+                "              minimal: minimal\n"
+                "              low: low\n"
+                "              medium: medium\n"
+                "              high: high\n"
+                "              xhigh: xhigh\n"
+                "              max: max\n"
+            )
+            effort_line = "    reasoningEffort: %s\n" % json.dumps(
+                # A custom endpoint's level passes through unchanged (the
+                # environment override was already validated by
+                # reasoning_effort_override()); normalizing by model_name could
+                # misclassify a catalog-shaped id as another family.
+                str(endpoint_effort)
+            )
+        else:
+            effort_declaration = "            reasoningEfforts: false\n"
+            effort_line = ""
         return (
             (
                 "# Generated by generic_debug_pipeline for this stage: --agent-model.\n"
@@ -2636,7 +2764,7 @@ def dsh_patch_text(
             "            name: %s\n"
             "            contextWindow: %s\n"
             "            maxTokens: %s\n"
-            "            reasoningEfforts: false\n"
+            "%s"
             "        compat:\n"
             "          maxTokensField: max_tokens\n"
             "          supportsStore: false\n"
@@ -2645,6 +2773,7 @@ def dsh_patch_text(
             "  config:\n"
             "    provider: %s\n"
             "    model: %s\n"
+            "%s"
             )
             % (
                 provider,
@@ -2654,8 +2783,10 @@ def dsh_patch_text(
                 json.dumps(model_name),
                 context_window,
                 max_tokens,
+                effort_declaration,
                 provider,
                 json.dumps(model_name),
+                effort_line,
             )
         )
     if family == "qwen":
@@ -2847,7 +2978,13 @@ def codex_provider_args(
         selection = inferred
     settings = _provider_family_settings(selection)
     family = settings["family"]
-    model = raw_model or selection.effective_model_id() or settings["model"]
+    # The argv is world-readable, so a credential-bearing URL must never be
+    # emitted verbatim; the DSH route already redacts the same raw_model.
+    model = (
+        _redacted_endpoint_text(raw_model)
+        or selection.effective_model_id()
+        or settings["model"]
+    )
     if family == "endpoint":
         raise ConfigError(
             "a custom --agent-model endpoint cannot run on gpt-codex; use dsh"
@@ -2960,14 +3097,17 @@ def claude_model_arg(
     """
     if selection.model is None or selection.is_default:
         return None
+    # A raw model may be a credentialed endpoint URL; the child argv is
+    # world-readable, so keep only the credential-free shape.
+    raw = _redacted_endpoint_text(raw_model)
     family = _normalized_family(selection)
     if family == "claude":
         info = selection.model_info()
-        return str(raw_model or info.get("alias") or info.get("id") or selection.model)
+        return str(raw or info.get("alias") or info.get("id") or selection.model)
     # The DeepSeek/Qwen/Dots routes select the model through the Anthropic
     # environment (ANTHROPIC_MODEL); passing the provider id as `--model` would
     # override that environment with an id Claude Code may not recognise.
-    return str(raw_model) if raw_model else None
+    return str(raw) if raw else None
 
 
 def _claude_code_effort(level: Any) -> str:
@@ -3022,15 +3162,18 @@ def claude_environment(
     root = _normalized_route_base_url(settings["base_url"])
     if root.endswith("/v1"):
         root = root[:-3]
-    key = str(settings["api_key"] or "dummy")
-    model = raw_model or str(settings["model"])
+    # Dots and DeepSeek require a real key; only the local Qwen route may run
+    # with the historical dummy value.  A missing key must not be turned into a
+    # bogus bearer token that hides the documented selection_problem.
+    key = str(settings["api_key"] or "")
+    if family == "qwen":
+        key = key or "dummy"
+    model = str(_redacted_endpoint_text(raw_model) or settings["model"])
     if family == "deepseek":
-        primary = raw_model or "deepseek-flash[1m]"
-        small = raw_model or "deepseek-flash"
+        primary = str(_redacted_endpoint_text(raw_model) or "deepseek-flash[1m]")
+        small = str(_redacted_endpoint_text(raw_model) or "deepseek-flash")
         env = {
             "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
-            "ANTHROPIC_AUTH_TOKEN": key,
-            "ANTHROPIC_API_KEY": key,
             "ANTHROPIC_MODEL": primary,
             "ANTHROPIC_DEFAULT_OPUS_MODEL": primary,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": primary,
@@ -3039,6 +3182,9 @@ def claude_environment(
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "786432",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         }
+        if key:
+            env["ANTHROPIC_AUTH_TOKEN"] = key
+            env["ANTHROPIC_API_KEY"] = key
         # Same catalog default as the DSH and Codex routes; an operator
         # override of the DeepSeek effort applies here too.  Translate the
         # generic level so ``off`` emits no ignored value and a level Claude
@@ -3051,14 +3197,15 @@ def claude_environment(
         return env
     env = {
         "ANTHROPIC_BASE_URL": root,
-        "ANTHROPIC_AUTH_TOKEN": key,
-        "ANTHROPIC_API_KEY": key,
         "ANTHROPIC_MODEL": model,
         "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
         "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     }
+    if key:
+        env["ANTHROPIC_AUTH_TOKEN"] = key
+        env["ANTHROPIC_API_KEY"] = key
     # Only an explicit operator override adds the effort: these
     # Anthropic-compatible endpoints do not document the field, so the model's
     # own default stays in place otherwise.  Translate the generic level, not
@@ -3133,13 +3280,15 @@ def effective_agent_model(cmd: Sequence[Any]) -> Dict[str, Any]:
         }
     if "codex" in exe:
         return {
-            "name": _arg("-m") or None,
+            # A -m value may be a credentialed endpoint URL; this record is
+            # documented as secret-free, so redact it like the other branches.
+            "name": _redacted_endpoint_text(_arg("-m")) or None,
             "harness": AGENT_HARNESS_GPT_CODEX,
             "source": "codex config or -m",
         }
     if "claude" in exe:
         return {
-            "name": _arg("--model") or None,
+            "name": _redacted_endpoint_text(_arg("--model")) or None,
             "harness": AGENT_HARNESS_CLAUDE_CODE,
             "source": "claude config or --model",
         }
