@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import tempfile
 import threading
 import time
@@ -22,6 +23,7 @@ from agent_common.llm_retry import (
     _forwardable_request_headers,
     _forwardable_response_headers,
     default_log,
+    dots_dsh_overlay,
     load_policy,
 )
 
@@ -562,6 +564,47 @@ class ProxyTests(unittest.TestCase):
             body = json.loads(response.read())
         self.assertTrue(body["ok"])
         self.assertEqual(self.upstream.hits, 3)
+
+
+class DshOverlayIdleBoundTests(unittest.TestCase):
+    """The Dots overlay's watchdog covers the whole retry ladder (F068).
+
+    A jittered retry sleeps up to ``1 + jitter_ratio`` times the configured
+    delay, and every attempt can additionally spend its own upstream timeout
+    before the next sleep starts.  A bound that covers only the nominal sleeps
+    aborts a retry sequence the proxy would still have completed.
+    """
+
+    def test_the_idle_bound_covers_jitter_and_per_attempt_time(self):
+        schedule = RetrySchedule(load_policy())
+        needed_ms = int(
+            (
+                sum(schedule.delays()) * (1.0 + schedule.jitter_ratio)
+                + (schedule.max_retries + 1) * 600.0
+            )
+            * 1000
+        )
+        overlay = dots_dsh_overlay(
+            model="dots3-note-prev",
+            base_url="https://note3-prev-api.askdiandian.com/v1",
+            context_window=393000,
+            max_tokens=65536,
+        )
+        match = re.search(r"streamIdleTimeoutMs:\s*(\d+)", overlay)
+        self.assertIsNotNone(match)
+        self.assertGreaterEqual(int(match.group(1)), needed_ms)
+
+    def test_an_explicit_longer_idle_override_still_wins(self):
+        overlay = dots_dsh_overlay(
+            model="dots3-note-prev",
+            base_url="https://note3-prev-api.askdiandian.com/v1",
+            context_window=393000,
+            max_tokens=65536,
+            stream_idle_timeout_ms=99_000_000,
+        )
+        match = re.search(r"streamIdleTimeoutMs:\s*(\d+)", overlay)
+        self.assertIsNotNone(match)
+        self.assertEqual(int(match.group(1)), 99_000_000)
 
 
 if __name__ == "__main__":
