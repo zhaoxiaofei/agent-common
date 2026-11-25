@@ -13,8 +13,10 @@ first by ``check_model_catalog.py`` and ``check_shared_package.py``.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
@@ -65,8 +67,12 @@ for entry in AGENT_MODELS.values():
     item = {
         "context_window": entry["context_window"],
         "max_tokens": entry["max_tokens"],
-        "chat_max_tokens": entry["chat_max_tokens"],
+        "chat_max_tokens": entry.get("chat_max_tokens"),
     }
+    if entry.get("dsh_provider"):
+        item["provider"] = entry["dsh_provider"]
+    if entry.get("api_key_env"):
+        item["api_key_env"] = entry["api_key_env"]
     base_url = entry.get("base_url")
     if not base_url:
         if entry["id"] == "qwen3.8-27b":
@@ -96,8 +102,12 @@ def item(model_id):
     result = {
         "context_window": entry["context_window"],
         "max_tokens": entry["max_tokens"],
-        "chat_max_tokens": entry["chat_max_tokens"],
+        "chat_max_tokens": entry.get("chat_max_tokens"),
     }
+    if entry.get("dsh_provider"):
+        result["provider"] = entry["dsh_provider"]
+    if entry.get("api_key_env"):
+        result["api_key_env"] = entry["api_key_env"]
     base_url = entry.get("base_url")
     if model_id == "qwen3.8-27b":
         base_url = getattr(llm, "DEFAULT_QWEN_BASE_URL", base_url)
@@ -141,8 +151,12 @@ def item(model_id):
     result = {
         "context_window": entry["context_window"],
         "max_tokens": entry["max_tokens"],
-        "chat_max_tokens": entry["chat_max_tokens"],
+        "chat_max_tokens": entry.get("chat_max_tokens"),
     }
+    if entry.get("dsh_provider"):
+        result["provider"] = entry["dsh_provider"]
+    if entry.get("api_key_env"):
+        result["api_key_env"] = entry["api_key_env"]
     base_url = entry.get("base_url")
     if model_id == "qwen3.8-27b":
         base_url = qwen.DEFAULT_BASE_URL
@@ -192,16 +206,22 @@ def probe(label: str, repo: Path, code: str) -> Optional[Dict[str, Any]]:
             [interpreter(repo), "-c", code],
             cwd=str(repo),
             capture_output=True,
-            text=True,
+            text=False,
+            timeout=120,
         )
+    except subprocess.TimeoutExpired:
+        print("FAIL %s probe timed out" % label)
+        return None
     except OSError as exc:
         print("FAIL %s probe could not run: %s" % (label, exc))
         return None
+    stdout = result.stdout.decode("utf-8", "replace")
+    stderr = result.stderr.decode("utf-8", "replace")
     if result.returncode != 0:
-        print("FAIL %s probe failed:\n%s" % (label, result.stderr.strip()))
+        print("FAIL %s probe failed:\n%s" % (label, _redacted_text(stderr.strip())))
         return None
     try:
-        observed = json.loads(result.stdout)
+        observed = json.loads(stdout)
     except (TypeError, ValueError) as exc:
         print("FAIL %s probe emitted invalid JSON: %s" % (label, exc))
         return None
@@ -216,23 +236,61 @@ def expected_fields(
 ) -> set:
     """Every fact the catalog records for one model (all are required)."""
     entry = (CATALOGUE if catalogue is None else catalogue)[model_id]
-    fields = {"context_window", "max_tokens", "chat_max_tokens"}
-    if entry.get("base_url"):
-        fields.add("base_url")
-    if entry.get("default_reasoning_level"):
-        fields.add("default_reasoning_level")
+    fields = {"context_window", "max_tokens"}
+    # The runtime treats chat_max_tokens as optional.  A probe may still report
+    # its adapter's default for it, so main() ignores the key when the catalog
+    # omits it instead of calling the observation an unexpected field.
+    if entry.get("chat_max_tokens") is not None:
+        fields.add("chat_max_tokens")
+    for field in ("base_url", "default_reasoning_level", "provider", "api_key_env"):
+        if entry.get(field):
+            fields.add(field)
     return fields
 
 
 def _redacted(value: Any) -> Any:
-    """A URL-valued field with credentials removed, for the failure output."""
+    """A URL-valued field with credentials removed, for the failure output.
+
+    The non-secret query is kept: dropping the whole query made
+    ``?api-version=2023`` and ``?api-version=2024`` print identically, hiding
+    the actual drift.
+    """
     if not isinstance(value, str):
         return value
     try:
-        from agent_common.model_runtime import redact_endpoint_url
+        from agent_common.model_runtime import _credential_key, redact_endpoint_url
+
+        safe = redact_endpoint_url(value)
+        parsed = urllib.parse.urlsplit(value)
+        kept = [
+            (key, item)
+            for key, item in urllib.parse.parse_qsl(
+                parsed.query.replace(";", "&"), keep_blank_values=True
+            )
+            if not _credential_key(key)
+        ]
+        if kept:
+            safe += "?" + urllib.parse.urlencode(kept, doseq=True)
+        return safe
     except Exception:  # noqa: BLE001 - the probe's own failure is reported elsewhere
-        return value
-    return redact_endpoint_url(value)
+        # Never print a credential just because the shared redactor was
+        # unavailable; keep only the scheme/host/path.
+        text = value.split("#", 1)[0].split("?", 1)[0]
+        if "://" in text:
+            scheme, _, rest = text.partition("://")
+            rest = rest.lstrip("/")
+            authority, separator, tail = rest.partition("/")
+            authority = authority.rsplit("@", 1)[-1]
+            return scheme + "://" + authority + separator + tail
+        return text.rsplit("@", 1)[-1] if "@" in text else text
+
+
+_URL_PATTERN = re.compile(r"https?://[^\s'\"]+")
+
+
+def _redacted_text(text: str) -> str:
+    """Redact credential-bearing URLs embedded in free-form probe output."""
+    return _URL_PATTERN.sub(lambda match: str(_redacted(match.group(0))), text)
 
 
 def main() -> int:
@@ -240,11 +298,16 @@ def main() -> int:
     if error:
         print("FAIL %s" % error)
         return 1
-    checks = subprocess.run(
-        [sys.executable, str(COMMON / "check_model_catalog.py")],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        checks = subprocess.run(
+            [sys.executable, str(COMMON / "check_model_catalog.py")],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        print("FAIL check_model_catalog.py timed out")
+        return 1
     print(checks.stdout.strip())
     if checks.returncode != 0:
         # A child crash (for example a checker bug) writes its diagnostic to
@@ -270,13 +333,33 @@ def main() -> int:
         for model_id in sorted(set(observed) - set(catalogue)):
             problems.append("%s: unexpected model %s" % (label, model_id))
         for model_id in sorted(set(observed) & set(catalogue)):
+            observation = observed[model_id]
+            if not isinstance(observation, Mapping):
+                problems.append(
+                    "%s: %s observation is not an object: %r"
+                    % (label, model_id, observation)
+                )
+                continue
             fields = expected_fields(model_id, catalogue)
-            for field in sorted(fields - set(observed[model_id])):
+            for field in sorted(fields - set(observation)):
                 problems.append("%s: %s is missing %s" % (label, model_id, field))
-            for field in sorted(fields & set(observed[model_id])):
-                value = observed[model_id][field]
+            for field in sorted(set(observation) - fields):
+                # F44 made the single-shot chat cap optional in the catalog.
+                # A sibling probe can still expose its own adapter default
+                # when the catalog omits the value; that is not a fact the
+                # canonical catalog owns, so it is not an unexpected field.
+                if (
+                    field == "chat_max_tokens"
+                    and catalogue[model_id].get(field) is None
+                ):
+                    continue
+                problems.append(
+                    "%s: %s has unexpected field %s" % (label, model_id, field)
+                )
+            for field in sorted(fields & set(observation)):
+                observed_value = observation[field]
                 expected = catalogue[model_id].get(field)
-                if expected != value:
+                if expected != observed_value:
                     # A drifted checkout can report a credential-bearing
                     # base_url; the checker used to print it verbatim three
                     # times.  model_runtime's own recorder redacts, so the
@@ -287,7 +370,7 @@ def main() -> int:
                             label,
                             model_id,
                             field,
-                            _redacted(value),
+                            _redacted(observed_value),
                             _redacted(expected),
                         )
                     )

@@ -718,8 +718,10 @@ class SelectionProblemDryRunTests(unittest.TestCase):
             self.assertEqual(
                 model_runtime.selection_problem(selection, dry_run=True), ""
             )
-            with self.assertRaises(model_runtime.ConfigError):
-                model_runtime.selection_problem(selection)
+            # The documented contract is a diagnostic string: an invalid
+            # override must not escape as an exception.
+            problem = model_runtime.selection_problem(selection)
+            self.assertIn("unknown reasoning effort", problem)
 
 
 class CatalogReloadTests(unittest.TestCase):

@@ -139,7 +139,12 @@ def turn_end_error(reason: Any) -> str:
     if not isinstance(reason, Mapping):
         return ""
     kind = str(reason.get("kind") or "").strip().lower()
-    if kind not in FAILURE_KINDS and not reason.get("error"):
+    # A success kind (or no kind and no error payload) has no error message.  A
+    # cancelled/aborted/interrupted reason is a failure too: turn_end_failed
+    # already treats every explicit non-success kind as one.
+    if not kind and not reason.get("error"):
+        return ""
+    if kind in SUCCESS_STATUSES and not reason.get("error"):
         return ""
     error = reason.get("error")
     if isinstance(error, Mapping):

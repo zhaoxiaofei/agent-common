@@ -73,6 +73,41 @@ class CrossRepoProbeTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("OK gdp, paper-refine-eval and paper-refine", output)
 
+    def test_a_catalog_without_the_optional_chat_cap_passes(self):
+        catalogue = {
+            model_id: dict(entry)
+            for model_id, entry in check_cross_repo_consistency.CATALOGUE.items()
+        }
+        for entry in catalogue.values():
+            entry.pop("chat_max_tokens", None)
+        observed = {}
+        for model_id, entry in catalogue.items():
+            observation = {
+                field: entry.get(field)
+                for field in check_cross_repo_consistency.expected_fields(
+                    model_id, catalogue
+                )
+            }
+            # A probe still reports its adapter default even when the catalog
+            # leaves the optional chat cap out.
+            observation["chat_max_tokens"] = None
+            observed[model_id] = observation
+        completed = mock.Mock(returncode=0, stdout="OK", stderr="")
+        output = io.StringIO()
+        with mock.patch.object(
+            check_cross_repo_consistency,
+            "_read_catalogue",
+            return_value=(catalogue, ""),
+        ), mock.patch.object(
+            check_cross_repo_consistency.subprocess, "run", return_value=completed
+        ), mock.patch.object(
+            check_cross_repo_consistency, "probe", return_value=observed
+        ):
+            with contextlib.redirect_stdout(output):
+                code = check_cross_repo_consistency.main()
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertIn("OK gdp, paper-refine-eval and paper-refine", output.getvalue())
+
     def test_a_malformed_catalog_is_reported_by_main_not_at_import(self):
         for text, message in (
             ("[]", "not a JSON object"),

@@ -75,8 +75,9 @@ else:  # pragma: no cover - a paper-refine frozen root has no package
 class ConfigError(Exception):
     """A model/harness configuration error.
 
-    The host repository replaces this class at import time (GDP aliases its
-    ``gdp.errors.ConfigError``) so callers keep their own error hierarchy.
+    The host repository may replace this class at import time (for example GDP
+    rebinds it to its own ``errors.ConfigError``) so callers keep their error
+    hierarchy.
 
     Example:
         ``resolve_agent_selection(model="unknown")`` raises this error (or the
@@ -279,46 +280,90 @@ _CATALOG_OWNED_MODEL_KEYS = (
 _CATALOG_BASE_SECRETS: Dict[str, str] = {}
 
 
+def _textual_authority(text: str) -> str:
+    """The authority-like component of an unparsable URL-shaped string.
+
+    A normal value puts the authority directly after the scheme separator, but
+    a malformed form may carry it after one extra slash (``http:/user@host/v1``)
+    or after the empty authority of ``http:///user@host/v1``.  The userinfo is
+    still the first ``@``-bearing component before the path, so look one
+    segment further when the first one has no ``@``.
+    """
+    head = str(text or "").split("#", 1)[0].split("?", 1)[0]
+    rest = head
+    if "://" in rest:
+        rest = rest.split("://", 1)[1]
+    elif rest.startswith("//"):
+        rest = rest[2:]
+    rest = rest.lstrip("/")
+    authority = rest.split("/", 1)[0]
+    if "@" not in authority and "/" in rest:
+        tail = rest.split("/", 1)[1]
+        segment = tail.split("/", 1)[0]
+        if "@" in segment:
+            return segment
+    return authority
+
+
 def _safe_endpoint_text(text: str) -> str:
     """Strip a URL-shaped string's authority userinfo, query and fragment.
 
     Used when the value cannot be parsed as an absolute HTTP(S) URL (a malformed
     or scheme-relative ``PAPER_*_BASE_URL``).  The generated patch/argv/
     environment are persisted artifacts, so the credential-bearing part must be
-    removed textually rather than returned verbatim.
+    removed textually rather than returned verbatim.  The textual authority
+    finder also covers malformed ``http:///user:pw@host/v1`` and
+    ``http:/user:pw@host/v1`` forms that ``urlsplit`` cannot represent.
     """
-    safe = text.split("#", 1)[0].split("?", 1)[0]
+    safe = str(text or "").split("#", 1)[0].split("?", 1)[0]
     prefix = ""
     rest = safe
     if "://" in rest:
         scheme, _, rest = rest.partition("://")
         prefix = scheme + "://"
+        # An extra slash is only part of the malformed credential spelling
+        # (``http:///user:pw@host/v1``); ``https:///v1`` with no userinfo must
+        # keep its shape.
+        stripped = rest.lstrip("/")
+        if "@" in stripped.split("/", 1)[0]:
+            rest = stripped
     elif rest.startswith("//"):
         prefix = "//"
         rest = rest[2:]
     authority, separator, tail = rest.partition("/")
-    authority = authority.rsplit("@", 1)[-1]
+    if "@" in authority:
+        authority = authority.rsplit("@", 1)[-1]
+    elif "@" in tail.split("/", 1)[0]:
+        segment, next_separator, remainder = tail.partition("/")
+        tail = segment.rsplit("@", 1)[-1] + next_separator + remainder
     return prefix + authority + separator + tail
+
+
+def _query_pairs(query: str) -> list:
+    """Parse a query string, also treating ``;`` as a separator.
+
+    ``parse_qsl`` only splits on ``&``, so a legacy ``x=1;api_key=SECRET`` query
+    kept the credential inside one value and every credential predicate missed
+    it.  A malformed query yields no pairs: it is not safe to forward blindly.
+    """
+    try:
+        return urllib.parse.parse_qsl(
+            str(query or "").replace(";", "&"), keep_blank_values=True
+        )
+    except ValueError:
+        return []
 
 
 def _carries_unparsed_credential(text: str) -> bool:
     """Detect userinfo/credential query textually when ``urlsplit`` fails."""
-    without_fragment = text.split("#", 1)[0]
-    before_query, _, query = without_fragment.partition("?")
-    authority = before_query
-    if "://" in authority:
-        authority = authority.split("://", 1)[1]
-    elif authority.startswith("//"):
-        authority = authority[2:]
-    authority = authority.split("/", 1)[0]
-    if "@" in authority:
+    without_fragment = str(text or "").split("#", 1)[0]
+    _before_query, _, query = without_fragment.partition("?")
+    if "@" in _textual_authority(without_fragment):
         return True
     if query:
-        try:
-            pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
-        except ValueError:
-            pairs = []
-        if any(_credential_key(key) for key, _value in pairs):
+        if any(
+            _credential_key(key) for key, _value in _query_pairs(query)
+        ):
             return True
     return False
 
@@ -340,18 +385,16 @@ def _textual_endpoint_secret(text: str) -> str:
 
     Used by ``split_endpoint_credentials`` for a scheme-less form such as
     ``user:pw@host/v1`` that ``urlsplit`` reads as scheme ``user`` with no
-    netloc.  A value whose authority is not usable (for example the
-    unparsable host ``[bad``) keeps the documented empty-secret result: there
-    is no endpoint to carry the credential to.
+    netloc, and for the malformed ``http:///user:pw@host/v1`` spelling.  A
+    value whose authority is not usable (for example the unparsable host
+    ``[bad``) keeps the documented empty-secret result: there is no endpoint to
+    carry the credential to.  A bare username (``TOKEN@host``) is the secret
+    too: the previous split silently dropped it and sent an unauthenticated
+    request.
     """
     before_query = str(text or "").split("#", 1)[0]
-    head, _, query = before_query.partition("?")
-    authority = head
-    if "://" in authority:
-        authority = authority.split("://", 1)[1]
-    elif authority.startswith("//"):
-        authority = authority[2:]
-    authority = authority.split("/", 1)[0]
+    _head, _, query = before_query.partition("?")
+    authority = _textual_authority(before_query)
     if "@" in authority:
         if not _usable_textual_authority(authority):
             return ""
@@ -359,12 +402,11 @@ def _textual_endpoint_secret(text: str) -> str:
         _user, separator, password = userinfo.partition(":")
         if separator:
             return password
+        # A username-only userinfo is the credential (for example a gateway
+        # bearer token written as ``https://TOKEN@host/v1``).
+        return userinfo
     if query:
-        try:
-            pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
-        except ValueError:
-            pairs = []
-        for key, value in pairs:
+        for key, value in _query_pairs(query):
             if _secret_query_key(key):
                 return value
     return ""
@@ -434,17 +476,16 @@ def split_endpoint_credentials(url: str) -> Tuple[str, str]:
         userinfo, _, host = netloc.rpartition("@")
         # Split at the first colon: a legal password may itself contain a
         # colon, and ``rsplit`` returned only its tail.  A bare username is
-        # not a secret, so it is not moved into the credential channel.
+        # itself the credential (a gateway bearer token written as
+        # ``https://TOKEN@host/v1``); dropping it made the live request
+        # unauthenticated while ``endpoint_credentials`` still reported a
+        # credential.
         _user, separator, password = userinfo.partition(":")
-        secret = password if separator else ""
+        secret = password if separator else userinfo
         netloc = host
     kept: list[Tuple[str, str]] = []
     if parsed.query:
-        try:
-            pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-        except ValueError:
-            pairs = []
-        for key, value in pairs:
+        for key, value in _query_pairs(parsed.query):
             if _secret_query_key(key):
                 if not secret:
                     secret = value
@@ -571,11 +612,14 @@ def endpoint_credentials(url: str) -> str:
         return ""
     if parsed.username is not None or parsed.password is not None:
         return "userinfo"
-    try:
-        pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    except ValueError:
-        return ""
-    for key, _value in pairs:
+    # A malformed authority (``http:///user:pw@host/v1`` or
+    # ``http:/user:pw@host/v1``) is not represented by ``urlsplit``, but it
+    # still carries a credential that must be rejected/redacted.  Only consult
+    # the textual fallback when there is no parsed authority: for a well-formed
+    # URL an ``@`` in the first path segment is a path character, not userinfo.
+    if not parsed.netloc and "@" in _textual_authority(str(url or "")):
+        return "userinfo"
+    for key, _value in _query_pairs(parsed.query):
         if _credential_key(key):
             return "query parameter %r" % key
     return ""
@@ -623,6 +667,17 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
     try:
         with _MODEL_CATALOG_PATH.open(encoding="utf-8") as handle:
             document = json.load(handle)
+        # The checker rejects an unsupported schema_version, but the runtime
+        # used to ignore it: a future document could load with silently
+        # different semantics while check_model_catalog passed on another
+        # file.  Require the same exact integer contract here.
+        if type(document.get("schema_version")) is not int or document.get(
+            "schema_version"
+        ) != 1:
+            raise ConfigError(
+                "unsupported schema_version %r in %s"
+                % (document.get("schema_version"), _MODEL_CATALOG_PATH)
+            )
         by_id: Dict[str, Dict[str, Any]] = {}
         base_secrets: Dict[str, str] = {}
         for entry in document["models"]:
@@ -1067,6 +1122,10 @@ REASONING_EFFORT_LEVELS: Tuple[str, ...] = (
 DEFAULT_ENDPOINT_CONTEXT = 32768
 DEFAULT_ENDPOINT_MAX_TOKENS = 8192
 
+#: Bound on the optional ``/models`` listing body: the probe must not read an
+#: arbitrarily large response into memory.
+_MAX_MODELS_BODY_BYTES = 1 << 20
+
 
 def reasoning_effort_override() -> Optional[str]:
     """The operator's explicit reasoning level for the selected model, or None.
@@ -1235,7 +1294,8 @@ def agent_model_choice(value: Any) -> str:
     if slug not in AGENT_MODELS:
         raise ValueError(
             "unknown model %r; use one of %s, or an http(s) chat-completions "
-            "endpoint URL" % (raw, ", ".join(AGENT_MODEL_CHOICES))
+            "endpoint URL"
+            % (_redacted_endpoint_text(raw), ", ".join(AGENT_MODEL_CHOICES))
         )
     return slug
 
@@ -1543,7 +1603,11 @@ class AgentSelection:
         """
         if self.model is None or self.is_endpoint or self.is_default:
             return {}
-        return dict(AGENT_MODELS.get(self.model) or {})
+        # The dataclass is public, so a directly constructed alias
+        # (``AgentSelection(model="gpt-6.1-sol")``) must resolve like a
+        # selected one instead of silently losing its catalog facts.
+        key = normalize_agent_model(self.model)
+        return dict(AGENT_MODELS.get(key) or {})
 
     def effective_model_id(self, raw_model: Optional[str] = None) -> Optional[str]:
         """The provider model id: the raw ``--model`` wins, then the model name.
@@ -1566,7 +1630,8 @@ class AgentSelection:
             return self.model_name or endpoint_query_model(str(self.model or "")) or None
         if self.model is None or self.is_default:
             return None
-        return str((AGENT_MODELS.get(self.model) or {}).get("id") or self.model)
+        key = normalize_agent_model(self.model)
+        return str((AGENT_MODELS.get(key) or {}).get("id") or self.model)
 
     def to_record(
         self,
@@ -1617,6 +1682,20 @@ class AgentSelection:
                     effective_endpoint
                 )
                 api_key_set = bool(url_secret)
+        if not api_key_set:
+            # Native provider selections resolve their key from the provider
+            # environment (DOTS_API_KEY, DEEPSEEK_API_KEY, the catalog's
+            # api_key_env, ...); the record used to report False even though
+            # selection_env exported the live credential.  The local Qwen
+            # route's historical "dummy" is not a configured credential.
+            try:
+                settings = _provider_family_settings(
+                    _effective_selection(self, raw_model)
+                )
+            except ConfigError:
+                settings = {}
+            key = settings.get("api_key")
+            api_key_set = bool(key) and str(key) != "dummy"
         return {
             "harness": self.harness,
             "model": record_model,
@@ -1646,7 +1725,8 @@ def resolve_agent_selection(
 ) -> AgentSelection:
     """Validate and resolve one producer/judge selection.
 
-    Raises :class:`gdp.errors.ConfigError` for a missing endpoint, an unknown
+    Raises :class:`agent_common.model_runtime.ConfigError` (or the host's
+    rebound subclass) for a missing endpoint, an unknown
     choice, an unsupported wire-protocol pair or request options that do not
     belong to a named model.
 
@@ -1659,13 +1739,16 @@ def resolve_agent_selection(
         A named model combined with ``api_key``/``model_name``/``prep_json`` raises
         ``ConfigError``; those options belong to a custom endpoint only.
     """
-    try:
-        prep = dict(prep_json or {})
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(
-            "the model request preparation must be a JSON object: %s" % exc
-        ) from None
+    # Validate through the same strict JSON contract as the string spelling:
+    # ``dict(...)`` accepted a list of pairs (not a JSON object), and a direct
+    # NaN/Infinity mapping was accepted although the JSON contract forbids it.
+    prep = parse_prep_json(prep_json)
     if legacy_agent:
+        if not isinstance(legacy_agent, str):
+            raise ConfigError(
+                "unknown legacy agent %r; a legacy agent name must be a string"
+                % (legacy_agent,)
+            )
         if legacy_agent not in LEGACY_AGENT_PAIRS:
             raise ConfigError(
                 "unknown legacy agent %r (expected one of %s)"
@@ -1693,6 +1776,14 @@ def resolve_agent_selection(
             model = agent_model_choice(model)
     except ValueError as exc:
         raise ConfigError(str(exc)) from None
+    for option, value in (("--agent-model-api-key", api_key),
+                          ("--agent-model-name", model_name)):
+        if value is not None and not isinstance(value, str):
+            # The constructor only copied a str and silently dropped 123/bytes,
+            # so the credential/name vanished without an error.
+            raise ConfigError(
+                "%s must be a string, not %s" % (option, type(value).__name__)
+            )
     resolved_harness, resolved_model = pair_from_options(harness, model)
 
     if (api_key or model_name or prep) and not agent_model_is_endpoint(resolved_model):
@@ -1736,7 +1827,11 @@ def resolve_agent_selection(
         api_key=(str(api_key).strip() if isinstance(api_key, str) and api_key.strip() else None),
         model_name=(str(model_name).strip() if isinstance(model_name, str)
                     and model_name.strip() else None),
-        prep_json=prep,
+        # The dataclass is frozen, so exposing a mutable mapping let one
+        # consumer change the validated request preparation.  A recursive
+        # read-only deep copy keeps equality/serialisation, rejects assignment
+        # at any depth, and stays JSON-serialisable for the prep proxy.
+        prep_json=_freeze_prep(prep),
     )
 
 
@@ -1902,18 +1997,34 @@ def _endpoint_catalog(base_url: str, api_key: str = "", timeout: float = 5.0) ->
             _NoRedirectHandler, urllib.request.ProxyHandler({})
         )
         with opener.open(request, timeout=timeout) as response:
-            body = json.loads(response.read().decode("utf-8", "replace"))
+            # A malicious/broken endpoint can stream an unbounded body; the
+            # timeout is per socket operation, not a byte budget.  Read one
+            # byte past the bound so an oversized listing is a failed probe
+            # instead of an out-of-memory.
+            raw_body = response.read(_MAX_MODELS_BODY_BYTES + 1)
+        if len(raw_body) > _MAX_MODELS_BODY_BYTES:
+            raise _EndpointProbeError(
+                "the endpoint /models listing is larger than %d bytes"
+                % _MAX_MODELS_BODY_BYTES
+            )
+        body = json.loads(raw_body.decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
-        if exc.code in (404, 405):
-            # The endpoint serves no listing route; that is the documented
-            # "no listing" case, not a failed probe.  A keyless local proxy
-            # commonly serves only /chat/completions.
-            return []
-        raise _EndpointProbeError(
-            "the endpoint /models listing failed with HTTP %d; check the API "
-            "key and that the endpoint serves an OpenAI-compatible /models "
-            "route" % exc.code
-        ) from None
+        # ``HTTPError`` is itself a response object; leaving it to GC retains
+        # the upstream socket on repeated probe failures.
+        try:
+            if exc.code in (404, 405):
+                # The endpoint serves no listing route; that is the documented
+                # "no listing" case, not a failed probe.  A keyless local proxy
+                # commonly serves only /chat/completions.
+                return []
+            raise _EndpointProbeError(
+                "the endpoint /models listing failed with HTTP %d; check the API "
+                "key and that the endpoint serves an OpenAI-compatible /models "
+                "route" % exc.code
+            ) from None
+        finally:
+            with contextlib.suppress(OSError):
+                exc.close()
     except (
         urllib.error.URLError,
         OSError,
@@ -2070,13 +2181,44 @@ def deep_merge(base: Dict[str, Any], override: Mapping[str, Any]) -> Dict[str, A
 
     Counterexample:
         A list or scalar override replaces the whole value; it is not appended or
-        merged element-wise.
+        merged element-wise.  A non-mapping override or a cyclic object raises
+        ``ConfigError`` instead of an ``AttributeError``/``RecursionError``.
     """
-    for key, value in (override or {}).items():
-        if isinstance(value, dict) and isinstance(base.get(key), dict):
-            deep_merge(base[key], value)
-        else:
-            base[key] = value
+    if not isinstance(base, dict):
+        raise ConfigError("the merge base must be a JSON object")
+    if not isinstance(override, Mapping):
+        raise ConfigError(
+            "the merge override must be a JSON object, not %s"
+            % type(override).__name__
+        )
+    return _deep_merge(base, override, set(), 0)
+
+
+def _deep_merge(
+    base: Dict[str, Any],
+    override: Mapping[str, Any],
+    active: set,
+    depth: int,
+) -> Dict[str, Any]:
+    if depth > 64:
+        raise ConfigError("the request preparation object is nested too deeply")
+    marker = id(override)
+    if marker in active:
+        raise ConfigError("the request preparation object is cyclic")
+    active.add(marker)
+    try:
+        for key, value in override.items():
+            if isinstance(value, Mapping):
+                if id(value) in active:
+                    raise ConfigError("the request preparation object is cyclic")
+                if isinstance(base.get(key), dict):
+                    _deep_merge(base[key], value, active, depth + 1)
+                else:
+                    base[key] = value
+            else:
+                base[key] = value
+    finally:
+        active.discard(marker)
     return base
 
 
@@ -2093,6 +2235,67 @@ def _finite_json_float(value: str) -> float:
     return number
 
 
+class _FrozenDict(dict):
+    """A read-only ``dict`` that ``json.dumps`` can still serialise.
+
+    ``MappingProxyType`` protects only its own level and is not a JSON type, so
+    the resolved ``prep_json`` cannot use it: ``start_prep_proxy`` must be able
+    to encode the validated object for the live request.  A dict subclass keeps
+    the native encoding path while every mutation method raises.
+    """
+
+    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("the resolved prep_json mapping is read-only")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+    def __ior__(self, other: Any) -> "_FrozenDict":
+        self._immutable()
+
+
+class _FrozenList(list):
+    """A read-only ``list`` that ``json.dumps`` can still serialise."""
+
+    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("the resolved prep_json list is read-only")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    append = _immutable
+    extend = _immutable
+    insert = _immutable
+    remove = _immutable
+    pop = _immutable
+    clear = _immutable
+    sort = _immutable
+    reverse = _immutable
+    __iadd__ = _immutable
+    __imul__ = _immutable
+
+
+def _freeze_prep(value: Any) -> Any:
+    """A recursively frozen, deep-copied ``prep_json`` tree.
+
+    The ``AgentSelection`` dataclass is frozen, so one consumer must not be
+    able to change the validated request preparation through a nested value.
+    The copy is also detached from the caller's object, so later mutation of
+    the caller's mapping cannot alter the stored selection.
+    """
+    if isinstance(value, Mapping):
+        return _FrozenDict(
+            (key, _freeze_prep(item)) for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return _FrozenList(_freeze_prep(item) for item in value)
+    return value
+
+
 def parse_prep_json(value: Any) -> Dict[str, Any]:
     """A JSON object for ``--agent-model-prep-json`` (an empty value is ``{}``).
 
@@ -2106,20 +2309,22 @@ def parse_prep_json(value: Any) -> Dict[str, Any]:
     """
     if value in (None, ""):
         return {}
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         # A caller can pass the object directly, bypassing the string parser's
         # guards.  Validate it with the same strict JSON contract (no NaN or
         # Infinity, no non-serialisable/cyclic value) before accepting it; the
-        # value later goes through json.dumps for the live request.  Return the
-        # caller's data unchanged rather than round-tripping it, so a valid
-        # object keeps its exact types.
+        # value later goes through json.dumps for the live request.  Convert
+        # any Mapping (MappingProxyType, a custom mapping, a frozen selection's
+        # prep_json) to a concrete dict first, because json.dumps only knows
+        # dict; a list of pairs is not a Mapping and stays rejected.
         try:
+            value = dict(value)
             json.dumps(value, allow_nan=False)
         except (TypeError, ValueError, RecursionError) as exc:
             raise ConfigError(
                 "--agent-model-prep-json is not valid JSON: %s" % exc
             ) from None
-        return dict(value)
+        return value
     try:
         # The default decoder accepts NaN/Infinity, which are not valid JSON
         # and would later be serialised into an invalid request body.
@@ -2140,6 +2345,35 @@ def parse_prep_json(value: Any) -> Dict[str, Any]:
 _PREP_OPENER = urllib.request.build_opener(
     _NoRedirectHandler, urllib.request.ProxyHandler({})
 )
+
+
+def _reject_dot_segments(path: str) -> None:
+    """Reject ``.``/``..`` path segments before they escape the proxy prefix."""
+    decoded = urllib.parse.unquote(str(path or ""))
+    if any(segment in (".", "..") for segment in decoded.split("/")):
+        raise ValueError(
+            "request target must not contain '.' or '..' path segments"
+        )
+
+
+def _append_query(target: str, extra: str) -> str:
+    """Merge ``extra`` into ``target``'s query, preferring the client's value.
+
+    Blindly appending produced ``?api-version=2023&api-version=2024``; a gateway
+    may take either.  A duplicate key already present in the client request
+    wins, and every other configured parameter is added.
+    """
+    if not extra:
+        return target
+    base, separator, existing = target.partition("?")
+    if not separator:
+        return target + "?" + extra
+    pairs = _query_pairs(existing)
+    client_keys = {key for key, _value in pairs}
+    pairs += [
+        (key, value) for key, value in _query_pairs(extra) if key not in client_keys
+    ]
+    return base + "?" + urllib.parse.urlencode(pairs, doseq=True)
 
 
 class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -2174,6 +2408,7 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
         # though it does not start with ``/v1/``, and prefixing it as well
         # produced ``/v1/v1?x=1`` on the upstream.
         path_only = path.split("?", 1)[0]
+        _reject_dot_segments(path_only)
         if path_only == "/v1" or path_only.startswith("/v1/"):
             path = path[3:]
         # http.client writes the request line as ASCII; a raw non-ASCII path
@@ -2181,9 +2416,7 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
         # encode it, keeping existing escapes and reserved characters.
         target = base + urllib.parse.quote(path, safe="/?&=%:@!$'()*+,;~-._[]")
         query = str(getattr(self.server, "target_query", "") or "")
-        if query:
-            target += ("&" if "?" in target else "?") + query
-        return target
+        return _append_query(target, query)
 
     def _forward(self, method: str, body: Optional[bytes] = None) -> None:
         headers = _forwardable_request_headers(
@@ -2221,6 +2454,8 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 with contextlib.suppress(OSError):
                     self.wfile.write(raw)
+                with contextlib.suppress(OSError):
+                    exc.close()
                 return
             try:
                 raw = exc.read()
@@ -2242,6 +2477,8 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 with contextlib.suppress(OSError):
                     self.wfile.write(raw)
+                with contextlib.suppress(OSError):
+                    exc.close()
                 return
             self.send_response(exc.code)
             forwarded_headers = _forwardable_response_headers(
@@ -2257,6 +2494,8 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             with contextlib.suppress(OSError):
                 self.wfile.write(raw)
+            with contextlib.suppress(OSError):
+                exc.close()
             return
         except ValueError as exc:
             # ``http.client`` encodes the request line as ASCII, so a non-ASCII
@@ -2466,10 +2705,16 @@ def stop_prep_proxy(server: Any = None) -> None:
     for item in targets:
         if item is None:
             continue
+        thread = getattr(item, "_gdp_thread", None)
         with contextlib.suppress(OSError):
             item.shutdown()
         with contextlib.suppress(OSError):
             item.server_close()
+        # ``start_prep_proxy`` stores the serving thread; without the join a
+        # caller cannot wait for the handler thread before reusing state.  The
+        # retry proxy's ``stop`` already joins.
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
 
 
 #: The DSH compaction summarizer calls the LLM adapter directly, outside
@@ -2572,6 +2817,44 @@ def _normalized_family(selection: AgentSelection) -> str:
     if selection.is_endpoint:
         return "endpoint"
     return str((AGENT_MODELS.get(selection.model or "") or {}).get("family") or "")
+
+
+def _effective_selection(
+    selection: AgentSelection, raw_model: Optional[str]
+) -> AgentSelection:
+    """The selection a raw ``--model`` names for the env/record builders.
+
+    ``dsh_patch_text``/``codex_provider_args``/``claude_environment`` infer a
+    family from a raw model when the selection is the ``default`` sentinel, and
+    treat a raw endpoint URL as an endpoint route.  ``selection_env`` and
+    ``to_record`` need the same inference or they report/export no credential
+    for a shape the patch configures.
+    """
+    if not raw_model:
+        return selection
+    text = str(raw_model)
+    if agent_model_is_endpoint(text):
+        return AgentSelection(
+            harness=selection.harness,
+            model=text,
+            legacy=selection.legacy,
+            api_key=selection.api_key,
+            model_name=selection.model_name,
+            prep_json=selection.prep_json,
+        )
+    if selection.model is not None and not selection.is_default:
+        return selection
+    canonical = normalize_agent_model(text)
+    if canonical in AGENT_MODELS:
+        return AgentSelection(
+            harness=selection.harness,
+            model=canonical,
+            legacy=selection.legacy,
+            api_key=selection.api_key,
+            model_name=selection.model_name,
+            prep_json=selection.prep_json,
+        )
+    return selection
 
 
 def _provider_family_settings(selection: AgentSelection) -> Dict[str, Any]:
@@ -2720,6 +3003,7 @@ def selection_env(
     selection: Optional[AgentSelection],
     *,
     endpoint_api_key_env: Optional[str] = None,
+    raw_model: Optional[str] = None,
 ) -> Dict[str, str]:
     """Credential environment needed by the selected provider.
 
@@ -2731,7 +3015,9 @@ def selection_env(
 
     ``endpoint_api_key_env`` must be the same name a caller passed to
     :func:`dsh_patch_text`; otherwise the generated provider config would read a
-    variable this function never exports.
+    variable this function never exports.  Pass the same ``raw_model`` too: a
+    ``default`` sentinel plus a raw catalog model gets its provider's key
+    environment from :func:`dsh_patch_text`, and this function must export it.
 
     Example:
         A Dots selection returns ``DOTS_API_KEY`` and the compaction key variable
@@ -2751,7 +3037,9 @@ def selection_env(
         env[AGENT_REASONING_EFFORT_ENV] = override
     if selection is None or selection.model is None:
         return env
-    settings = _provider_family_settings(selection)
+    settings = _provider_family_settings(
+        _effective_selection(selection, raw_model)
+    )
     family = settings["family"]
     if family == "endpoint":
         # The caller named the variable the generated patch reads.  A real key
@@ -2786,7 +3074,10 @@ def selection_env(
 
 
 def selection_problem(
-    selection: Optional[AgentSelection], *, dry_run: bool = False
+    selection: Optional[AgentSelection],
+    *,
+    dry_run: bool = False,
+    raw_model: Optional[str] = None,
 ) -> str:
     """A configuration problem that would fail the first real request ('' = none).
 
@@ -2795,7 +3086,9 @@ def selection_problem(
 
     Counterexample:
         ``dry_run=True`` returns ``""`` by design; absence of a problem in dry-run
-        does not mean the live request will work.
+        does not mean the live request will work.  Pass the same ``raw_model``
+        given to :func:`dsh_patch_text` when the selection is the ``default``
+        sentinel, or the preflight inspects the wrong family.
     """
     if selection is None or selection.model is None:
         return ""
@@ -2803,15 +3096,27 @@ def selection_problem(
         # Do not evaluate the request-side settings at all: an invalid operator
         # override must not turn the documented dry-run no-op into an exception.
         return ""
-    settings = _provider_family_settings(selection)
+    effective = _effective_selection(selection, raw_model)
+    try:
+        settings = _provider_family_settings(effective)
+    except ConfigError as exc:
+        # The documented contract is a diagnostic string, so an invalid
+        # reasoning override must not escape as an exception.
+        return str(exc)
     family = settings["family"]
     if family == "endpoint":
         # Run the same endpoint resolution the live request uses, so an
         # ambiguous listing (or a failed /models probe) is reported here
         # instead of surfacing as a plausible but wrong ``default`` model.
-        _model_name, _context_window, error = resolve_endpoint_model(selection)
+        _model_name, _context_window, error = resolve_endpoint_model(effective)
         return error
-    if family == "deepseek" and selection.harness in (
+    # Validate the same route capacities/base URL the generated patch enforces;
+    # selection_problem used to return "" for a value dsh_patch_text rejected.
+    try:
+        dsh_patch_text(effective)
+    except ConfigError as exc:
+        return str(exc)
+    if family == "deepseek" and effective.harness in (
         AGENT_HARNESS_GPT_CODEX,
         AGENT_HARNESS_CLAUDE_CODE,
     ):
@@ -2820,7 +3125,7 @@ def selection_problem(
                 "DEEPSEEK_API_KEY is not set; %s/deepseek-flash needs the "
                 "DeepSeek Responses/Anthropic route credential. Export "
                 "DEEPSEEK_API_KEY (or PAPER_DEEPSEEK_API_KEY)."
-                % selection.harness
+                % effective.harness
             )
     if family == "dots" and not settings["api_key"]:
         return (
@@ -2843,6 +3148,13 @@ def _resolve_token_capacities(
     value is rejected instead of being silently treated as unset, and a max
     that does not fit inside the context window is rejected too.
     """
+    if context_window_override is not None and type(context_window_override) is not int:
+        # ``int(True)`` is 1 and ``int(150000.9)`` truncates; the catalog and
+        # the checker require an exact JSON integer, so the override path must
+        # not silently accept a different type.
+        raise ConfigError("the context window override must be an integer")
+    if max_tokens_override is not None and type(max_tokens_override) is not int:
+        raise ConfigError("the max tokens override must be an integer")
     context = (
         settings.get("context_window")
         if context_window_override is None
@@ -2883,20 +3195,38 @@ def _normalized_patch_base_url(value: Any) -> str:
     return endpoint_base(str(value or ""))
 
 
+def _non_secret_query(url: Any) -> str:
+    """The non-credential query of ``url``, in its original spelling order."""
+    try:
+        parsed = urllib.parse.urlsplit(str(url or ""))
+    except ValueError:
+        return ""
+    kept = [
+        (key, value)
+        for key, value in _query_pairs(parsed.query)
+        if not _secret_query_key(key)
+    ]
+    return urllib.parse.urlencode(kept, doseq=True) if kept else ""
+
+
 def _normalized_route_base_url(value: Any) -> str:
-    """Normalize a route base URL, tolerating the legacy malformed forms.
+    """Normalize a route base URL, tolerating trailing-slash legacy forms.
 
     ``dsh_patch_text`` uses :func:`endpoint_base` and fails on a malformed URL.
     The Codex and Claude routes historically accepted the rstrip-only value and
     kept a ``/chat/completions`` suffix; normalize it here so all three routes
-    agree, without turning a malformed legacy value into an exception.
+    agree.
 
-    A value that parses into a non-http(s) or scheme-relative URL with an
-    authority is not a malformed legacy form: neither route can use it, and
-    returning it would silently export an unusable base to the child, so it
-    raises the same ``ConfigError`` as :func:`endpoint_base`.
+    A value with no host (for example the credential-free ``host/v1`` left
+    behind by scrubbing ``user:pw@host/v1``) is not a usable endpoint either;
+    exporting it made every child request fail, so it raises the same
+    ``ConfigError`` as :func:`endpoint_base` instead of returning a bare host.
     """
     text = str(value or "")
+    if not text:
+        # A native route (DeepSeek) has no base URL; "" is "no override", not
+        # an invalid endpoint.
+        return ""
     try:
         return endpoint_base(text)
     except ConfigError:
@@ -2905,12 +3235,10 @@ def _normalized_route_base_url(value: Any) -> str:
         except ValueError:
             # Unparsable legacy forms (already credential-free) stay tolerated.
             return text.rstrip("/")
-        if parsed.netloc and parsed.scheme not in ("http", "https"):
+        if not parsed.netloc:
             raise
-        if _carries_unparsed_credential(text):
-            # ``user:pw@host/v1`` parses as scheme "user" with no netloc and
-            # used to fall through here verbatim into the Codex/Claude env.
-            return _safe_endpoint_text(text).rstrip("/")
+        if parsed.scheme not in ("http", "https"):
+            raise
         return text.rstrip("/")
 
 
@@ -2953,9 +3281,15 @@ def dsh_patch_text(
     family = settings["family"]
     raw_info: Dict[str, Any] = {}
     raw_endpoint = bool(raw_model) and agent_model_is_endpoint(str(raw_model))
-    if (selection.is_default or selection.model is None) and raw_model:
+    if raw_model and (
+        selection.is_default
+        or selection.model is None
+        or agent_model_is_endpoint(str(raw_model))
+    ):
         # The sentinel/legacy shape has no catalog entry of its own, but a raw
-        # model still names its family.  Resolve the family *before* the
+        # model still names its family.  A raw endpoint URL always names the
+        # endpoint route, even on a named selection; otherwise it was emitted
+        # as that provider's model id.  Resolve the family *before* the
         # per-family builders so a raw qwen/dots/deepseek model gets the same
         # provider block (base URL, key env, limits, effort) as a named one.
         raw_info = AGENT_MODELS.get(normalize_agent_model(raw_model)) or {}
@@ -2975,7 +3309,9 @@ def dsh_patch_text(
             selection = AgentSelection(
                 harness=selection.harness,
                 model=str(raw_model),
+                legacy=selection.legacy,
                 api_key=selection.api_key,
+                model_name=selection.model_name,
                 prep_json=selection.prep_json,
             )
             settings = _provider_family_settings(selection)
@@ -2996,6 +3332,14 @@ def dsh_patch_text(
         base_url = _normalized_patch_base_url(
             base_url_override or settings["base_url"]
         )
+        if base_url_override is None:
+            # A gateway can require a non-secret query parameter
+            # (``api-version=2024``); endpoint_base drops the whole query for
+            # artifact safety, and the prep proxy is only started when a prep
+            # object exists.  Keep the non-secret part in the generated base.
+            query = _non_secret_query(selection.model)
+            if query:
+                base_url += "?" + query
         context_window, max_tokens = _resolve_token_capacities(
             settings,
             context_window_override,
@@ -3011,6 +3355,11 @@ def dsh_patch_text(
         # family" contract instead of carrying the level in the child
         # environment while ignoring it here.
         endpoint_effort = effort_override or settings["effort"]
+        if endpoint_effort:
+            # Validate the explicit override against the one documented
+            # vocabulary; an endpoint's level otherwise passed straight into
+            # ``reasoningEffort: "turbo"``.
+            endpoint_effort = normalize_reasoning_effort("", str(endpoint_effort))
         if endpoint_effort:
             effort_declaration = (
                 "            reasoningEfforts:\n"
@@ -3166,6 +3515,8 @@ def dsh_patch_text(
             max_tokens=max_tokens,
             regular_api_key_env=settings["api_key_env"],
             compaction_base_url=compaction_base,
+            # The proxy owns the retries only when the caller started one.
+            compaction_is_proxy=bool(compaction_base),
             reasoning_effort=str(
                 effort_override or settings["effort"] or DOTS_DEFAULT_EFFORT
             ),
@@ -3241,6 +3592,13 @@ def codex_provider_args(
         A custom endpoint raises ``ConfigError``; Codex cannot speak the
         chat-completions URL directly.
     """
+    if raw_model and agent_model_is_endpoint(str(raw_model)):
+        # A raw http(s) ``--model`` is an endpoint, never a provider model id,
+        # even when the selection names another model.  Emitting the URL as
+        # ``model="https://host/v1"`` made Codex send a nonsense model id.
+        raise ConfigError(
+            "a custom --agent-model endpoint cannot run on gpt-codex; use dsh"
+        )
     if selection.model is None or selection.is_default:
         inferred = None
         if raw_model and agent_model_is_endpoint(str(raw_model)):
@@ -3394,9 +3752,14 @@ def claude_model_arg(
 
     Counterexample:
         ``None`` means "let Claude Code use its configured model"; it is not an
-        error.
+        error.  A raw http(s) endpoint URL raises ``ConfigError``: a URL is not
+        a Claude model id.
     """
-    # A raw model may be a credentialed endpoint URL; the child argv is
+    if raw_model and agent_model_is_endpoint(str(raw_model)):
+        raise ConfigError(
+            "a custom --agent-model endpoint cannot run on claude-code; use dsh"
+        )
+    # A raw model may be a credentialed non-URL value; the child argv is
     # world-readable, so keep only the credential-free shape.
     raw = _redacted_endpoint_text(raw_model)
     if selection.model is None or selection.is_default:
@@ -3445,8 +3808,14 @@ def claude_environment(
 
     Counterexample:
         A GPT/Claude/endpoint selection returns ``{}``; the function does not
-        invent an Anthropic route for an unsupported family.
+        invent an Anthropic route for an unsupported family.  A raw http(s)
+        ``--model`` raises ``ConfigError`` because it is an endpoint, not a
+        Claude model id.
     """
+    if raw_model and agent_model_is_endpoint(str(raw_model)):
+        raise ConfigError(
+            "a custom --agent-model endpoint cannot run on claude-code; use dsh"
+        )
     if selection is None:
         # Preserve the documented "carry an explicit override even with no
         # selection" behaviour.
@@ -3619,6 +3988,15 @@ def effective_agent_model(cmd: Sequence[Any]) -> Dict[str, Any]:
             "source": "claude config or --model",
         }
     if "dsh" in exe:
+        # The dsh branch used to always report "profile", losing an explicit
+        # ``--model``/``-m`` passed after the profile flags.
+        model = _arg("--model") or _arg("-m")
+        if model:
+            return {
+                "name": _redacted_endpoint_text(model),
+                "harness": AGENT_HARNESS_DSH,
+                "source": "dsh argv --model",
+            }
         return {
             "name": None,
             "harness": AGENT_HARNESS_DSH,

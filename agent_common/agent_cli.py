@@ -47,5 +47,9 @@ def build_dsh_argv(
     if json_stream:
         # NDJSON on stdout (session/text/tool/final events) instead of the bare final answer.
         argv.append("--json")
+    if isinstance(extra_args, str):
+        # ``Sequence[str]`` is also satisfied by a plain string, which used to
+        # be iterated into one argv element per character.
+        extra_args = (extra_args,)
     argv += [str(item) for item in extra_args]
     return argv

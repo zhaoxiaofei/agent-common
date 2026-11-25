@@ -17,6 +17,7 @@ behaviour that matters:
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import sys
@@ -40,6 +41,35 @@ COPIES = (
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _model_runtime_aliases(tree: ast.AST) -> set:
+    """Every local name that imports the shared ``model_runtime`` module."""
+    aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "model_runtime" or alias.name.endswith(
+                    ".model_runtime"
+                ):
+                    aliases.add(alias.asname or alias.name.split(".")[-1])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "model_runtime":
+                    aliases.add(alias.asname or alias.name)
+    return aliases
+
+
+def _uses_attribute(tree: ast.AST, aliases: set, attribute: str) -> bool:
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == attribute
+            and isinstance(node.value, ast.Name)
+            and node.value.id in aliases
+        ):
+            return True
+    return False
 
 
 def main() -> int:
@@ -81,6 +111,17 @@ def main() -> int:
     if not isinstance(document, dict):
         print("FAIL canonical policy is not a JSON object")
         return 1
+    # A future/incompatible schema is not a tuning refresh; the runtime merge
+    # ignores schema_version, so the checker must pin it.
+    if type(document.get("schema_version")) is not int or document.get(
+        "schema_version"
+    ) != 1:
+        problems.append(
+            "unsupported schema_version %r" % (document.get("schema_version"),)
+        )
+    description = document.get("description")
+    if not isinstance(description, str) or not description.strip():
+        problems.append("the policy must carry a non-empty description")
     # The checker must not accept a policy that load_policy would reject and
     # silently replace with the defaults.  Import here, after the syntax check,
     # so an invalid canonical module is reported instead of crashing the checker
@@ -197,12 +238,22 @@ def main() -> int:
             # checker must report as FAIL, not abort with a traceback.
             problems.append("cannot read adapter %s: %s" % (adapter, exc))
             continue
-        if "import model_runtime as rt" not in text:
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as exc:
+            problems.append("cannot parse adapter %s: %s" % (adapter, exc))
+            continue
+        aliases = _model_runtime_aliases(tree)
+        if not aliases:
             problems.append("%s does not import the shared model runtime" % adapter)
+            continue
+        # Parse the wiring instead of searching for one exact spelling: a
+        # comment/dead string used to satisfy the check while a valid alias
+        # failed it.
         if name in ("paper_dots_agent.py", "paper_qwen_agent.py"):
-            if "rt.RETRY_SCHEDULE" not in text:
+            if not _uses_attribute(tree, aliases, "RETRY_SCHEDULE"):
                 problems.append("%s does not use the shared retry schedule" % adapter)
-            if "rt.dsh_patch_text" not in text:
+            if not _uses_attribute(tree, aliases, "dsh_patch_text"):
                 problems.append("%s does not generate its DSH patch via common" % adapter)
 
     if problems:

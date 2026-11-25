@@ -89,9 +89,25 @@ def _declared_content_length(headers: Mapping[str, str]) -> Optional[int]:
 def _read_request_body(
     rfile: Any, headers: Mapping[str, str]
 ) -> Optional[bytes]:
-    """Read the declared request body, or ``None`` for an empty one."""
+    """Read exactly the declared request body, or ``None`` for an empty one.
+
+    A single ``read(length)`` may return a short body when the client closes
+    early; forwarding that short body with a rewritten Content-Length corrupted
+    the request instead of rejecting it.  A truncated body raises ValueError so
+    both proxies answer 400.
+    """
     length = _declared_content_length(headers)
-    return rfile.read(length) if length else None
+    if not length:
+        return None
+    chunks = []
+    remaining = length
+    while remaining:
+        chunk = rfile.read(remaining)
+        if not chunk:
+            raise ValueError("truncated request body")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def _forwardable_request_headers(
@@ -110,11 +126,19 @@ def _forwardable_request_headers(
             if name.lower() == "connection"
         )
     )
-    return {
-        name: value
-        for name, value in headers.items()
-        if name.lower() not in skip
-    }
+    forwarded: Dict[str, str] = {}
+    for name, value in headers.items():
+        if name.lower() in skip:
+            continue
+        # ``headers.items()`` yields a repeated header once per value, but a
+        # dict comprehension kept only the last one (two Cookies became one).
+        # RFC 7230 allows joining most fields with ", "; Cookie uses "; ".
+        if name in forwarded:
+            separator = "; " if name.lower() == "cookie" else ", "
+            forwarded[name] = forwarded[name] + separator + str(value)
+        else:
+            forwarded[name] = str(value)
+    return forwarded
 
 
 def _forwardable_response_headers(
@@ -309,10 +333,10 @@ def load_policy(path: Optional[Any] = None) -> Dict[str, Any]:
         A malformed file is not fatal either; both fall back to the defaults.  Do
         not use this function when the caller must reject a bad policy.
     """
-    candidate = Path(path) if path is not None else Path(__file__).with_name(
-        "llm_policy.json"
-    )
     try:
+        candidate = Path(path) if path is not None else Path(__file__).with_name(
+            "llm_policy.json"
+        )
         document = json.loads(candidate.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError, RecursionError):
         # A valid but deeply nested document raises RecursionError, not ValueError; the
@@ -340,7 +364,12 @@ def policy_paths(*candidates: Optional[Any]) -> Optional[Path]:
     for candidate in candidates:
         if not candidate:
             continue
-        path = Path(candidate)
+        try:
+            path = Path(candidate)
+        except (TypeError, ValueError):
+            # A bytes path is a legal path-like spelling to some callers but
+            # Path() rejects it; it is simply not a usable candidate.
+            continue
         if path.is_file():
             return path
     return Path(__file__).with_name("llm_policy.json")
@@ -388,8 +417,19 @@ class RetrySchedule:
                     DEFAULT_POLICY["retry"]["max_delay_seconds"],
                 ),
             ),
-            "retryable_http_statuses": raw.get("retryable_http_statuses") or [],
-            "retryable_error_codes": raw.get("retryable_error_codes") or [],
+            # ``or []`` turned a present-but-empty mapping/string/false value
+            # into "absent" before _merge_policy's type check, installing an
+            # empty retry set instead of rejecting the bad policy.
+            "retryable_http_statuses": (
+                raw["retryable_http_statuses"]
+                if "retryable_http_statuses" in raw
+                else []
+            ),
+            "retryable_error_codes": (
+                raw["retryable_error_codes"]
+                if "retryable_error_codes" in raw
+                else []
+            ),
         }
         retry = _merge_policy({"retry": base})["retry"]
         self.initial_delay_seconds = float(retry["initial_delay_seconds"])
@@ -803,12 +843,46 @@ def _credential_query_key(name: Any) -> bool:
     return normalized.endswith(_CREDENTIAL_QUERY_SUFFIXES)
 
 
+def _reject_dot_segments(path: str) -> None:
+    """Reject ``.``/``..`` segments before they escape the proxy prefix."""
+    decoded = urllib.parse.unquote(str(path or ""))
+    if any(segment in (".", "..") for segment in decoded.split("/")):
+        raise ValueError(
+            "request target must not contain '.' or '..' path segments"
+        )
+
+
+def _append_merged_query(target: str, extra: str) -> str:
+    """Merge ``extra`` into ``target``'s query, preferring the client's value."""
+    if not extra:
+        return target
+    base, separator, existing = target.partition("?")
+    if not separator:
+        return target + "?" + extra
+    pairs = urllib.parse.parse_qsl(
+        existing.replace(";", "&"), keep_blank_values=True
+    )
+    client_keys = {key for key, _value in pairs}
+    pairs += [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(
+            extra.replace(";", "&"), keep_blank_values=True
+        )
+        if key not in client_keys
+    ]
+    return base + "?" + urllib.parse.urlencode(pairs, doseq=True)
+
+
 def _query_carries_credential(query: str) -> bool:
     """Whether an upstream base query contains a credential-named parameter."""
     if not query:
         return False
     try:
-        pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+        # ``parse_qsl`` only splits on ``&``; a legacy ``x=1;api_key=SECRET``
+        # kept the credential inside one value and was forwarded verbatim.
+        pairs = urllib.parse.parse_qsl(
+            query.replace(";", "&"), keep_blank_values=True
+        )
     except ValueError:
         # A query too malformed to inspect is not safe to forward verbatim.
         return True
@@ -944,6 +1018,7 @@ class RetryProxy:
         # Compare only the path component: ``/v1?x=1`` is already under a
         # ``/v1`` prefix even though it does not start with ``/v1/``.
         path_only = requested.split("?", 1)[0]
+        _reject_dot_segments(path_only)
         if self._prefix and (
             path_only == self._prefix
             or path_only.startswith(self._prefix + "/")
@@ -951,8 +1026,7 @@ class RetryProxy:
             target = requested
         else:
             target = self._prefix + requested
-        if self._query:
-            target += ("&" if "?" in target else "?") + self._query
+        target = _append_merged_query(target, self._query)
         # http.client writes the request line as ASCII; a raw non-ASCII path
         # raised UnicodeEncodeError and killed the handler thread.  Percent
         # encode it, keeping existing escapes and reserved characters.
@@ -1241,42 +1315,35 @@ def _yaml_scalar(value: Any) -> str:
 
 
 def _overlay_base_url(value: Any) -> str:
-    """A persisted base URL with userinfo, query and fragment removed.
+    """A persisted, routable base URL with userinfo, query and fragment removed.
 
     ``dots_dsh_overlay`` is a public generator, so a direct caller can pass a
     credential-bearing ``PAPER_*_BASE_URL``-shaped value.  The generated
     ``dsh_model_patch.yml`` is agent-readable; keep the live credential out of
     it, matching ``model_runtime.endpoint_base``.  This module stays standalone
     (no sibling import), so the normalisation is local.
+
+    A value without an http(s) scheme and host cannot route, so it raises
+    ``ValueError`` (credential-free) instead of being emitted as ``baseURL``.
     """
     text = str(value or "").strip()
     try:
         parsed = urllib.parse.urlsplit(text)
     except ValueError:
-        parsed = None
-    if parsed is not None and parsed.netloc:
-        netloc = parsed.netloc.rsplit("@", 1)[-1]
-        path = parsed.path.rstrip("/")
-        if path.endswith("/chat/completions"):
-            path = path[: -len("/chat/completions")].rstrip("/")
-        return urllib.parse.urlunsplit((parsed.scheme, netloc, path, "", ""))
-    # A host-less or unparsable value still may carry userinfo/query text;
-    # strip those parts textually rather than copying the secret.  The
-    # userinfo always lives in the authority before the first "/", whether or
-    # not a scheme is present, so a bare "user:pw@host/v1" is scrubbed too.
-    without_fragment = text.split("#", 1)[0]
-    before_query = without_fragment.split("?", 1)[0]
-    prefix = ""
-    remainder = before_query
-    if "://" in remainder:
-        scheme, _, remainder = remainder.partition("://")
-        prefix = scheme + "://"
-    elif remainder.startswith("//"):
-        prefix = "//"
-        remainder = remainder[2:]
-    authority, separator, tail = remainder.partition("/")
-    authority = authority.rsplit("@", 1)[-1]
-    return (prefix + authority + separator + tail).rstrip("/")
+        raise ValueError("base_url is not a valid http(s) URL") from None
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("base_url must be an http(s) URL with a host")
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ValueError("base_url has an invalid port") from None
+    if port is not None and not 0 < port <= 65535:
+        raise ValueError("base_url has an invalid port: %d" % port)
+    netloc = parsed.netloc.rsplit("@", 1)[-1]
+    path = parsed.path.rstrip("/")
+    if path.endswith("/chat/completions"):
+        path = path[: -len("/chat/completions")].rstrip("/")
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, path, "", ""))
 
 
 def dots_dsh_overlay(
@@ -1289,6 +1356,7 @@ def dots_dsh_overlay(
     max_tokens: int,
     regular_api_key_env: Optional[str] = None,
     compaction_base_url: Optional[str] = None,
+    compaction_is_proxy: bool = False,
     stream_idle_timeout_ms: Optional[int] = None,
     reasoning_effort: str = "high",
 ) -> str:
@@ -1298,7 +1366,10 @@ def dots_dsh_overlay(
     ``dots-compaction`` provider spends the dedicated key and points at the
     retrying proxy.  When the proxy is in the path it owns the retries, so the
     compaction provider carries no second ``retryPolicy``; without the proxy it
-    keeps the policy.  ``compaction-basic`` routes summarization to it.
+    keeps the policy.  ``compaction_is_proxy`` states that explicitly: the
+    default ``False`` keeps the retry ladder for a direct ``compaction_base_url``
+    URL, and the internal ``dsh_patch_text`` path passes ``True`` only when it
+    actually started a proxy.  ``compaction-basic`` routes summarization to it.
 
     The Dots API exposes a single thinking level, so the model declares every
     thinking level against the wire's ``max`` value and ``reasoning_effort``
@@ -1325,11 +1396,28 @@ def dots_dsh_overlay(
     document = _merge_policy(policy or load_policy())
     dots = document["dots"]
     compaction = document["compaction"]
+    # Validate the capacities: int() alone accepted 0/negative and emitted a
+    # model block no harness can satisfy.
+    try:
+        context_window = int(context_window)
+        max_tokens = int(max_tokens)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("context_window and max_tokens must be integers") from None
+    if context_window <= 0:
+        raise ValueError("context_window must be positive, not %d" % context_window)
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be positive, not %d" % max_tokens)
+    if max_tokens >= context_window:
+        raise ValueError(
+            "max_tokens %d must be below context_window %d"
+            % (max_tokens, context_window)
+        )
     # The overlay is a persisted artifact: a direct caller's credential-bearing
     # base URL must not reach baseURL:.  The internal dsh_patch_text path
     # already normalises it, but the public generator must protect itself.
     base_url = _overlay_base_url(base_url)
     compaction_base = _overlay_base_url(compaction_base_url or base_url)
+    proxy_in_path = bool(compaction_is_proxy)
     # Normalize first: a whitespace-only value is absent and must use the
     # default, not strip to "" and match the thinking-off sentinel.
     effort = str(reasoning_effort or "").strip().lower() or "high"
@@ -1343,11 +1431,20 @@ def dots_dsh_overlay(
     idle = int(stream_idle_timeout_ms or 0)
     # Actual retry sleeps jitter the configured delay UP by ``jitter_ratio``,
     # and each attempt can also spend its own upstream timeout before the next
-    # sleep starts.  The idle watchdog must cover both, or it aborts a retry
-    # sequence the proxy would still have completed (F068).
+    # sleep starts.  A ``Retry-After`` hint may sleep up to
+    # ``retry_after_cap_seconds``, which can exceed ``max_delay_seconds``, so
+    # the worst per-retry sleep is the larger of the two.  The idle watchdog
+    # must cover both, or it aborts a retry sequence the proxy would still have
+    # completed.
     schedule = RetrySchedule(document)
+    worst_retry_sleep = max(
+        schedule.max_delay_seconds, schedule.retry_after_cap_seconds
+    )
     retry_sleep_ms = int(
-        sum(schedule.delays()) * (1.0 + schedule.jitter_ratio) * 1000
+        worst_retry_sleep
+        * schedule.max_retries
+        * (1.0 + schedule.jitter_ratio)
+        * 1000
     )
     idle = max(
         idle,
@@ -1407,9 +1504,10 @@ def dots_dsh_overlay(
         "          maxTokensField: max_tokens",
         "          supportsStore: false",
     ]
-    if not compaction_base_url:
-        # The proxied compaction route already retries every upstream call in RetryProxy.
-        # A retryPolicy here would multiply the two budgets (up to 11x11 attempts).
+    if not proxy_in_path:
+        # The proxied compaction route already retries every upstream call in
+        # RetryProxy; a retryPolicy here would multiply the two budgets (up to
+        # 11x11 attempts).  A direct (non-proxy) URL keeps the ladder.
         lines.extend(retry_policy_yaml(document, "        ").rstrip("\n").splitlines())
     lines += [
         "- id: agent-default-model",
@@ -1442,6 +1540,12 @@ class _ProxyRegistry:
 
     def add(self, item: Any, *, kind: str, base: str = "") -> None:
         with self._lock:
+            # Re-registering one item must not leave its old base alias
+            # pointing at it; the stale key could select/stop the proxy and
+            # grew without bound.
+            for known_base, known in list(self.by_base.items()):
+                if known is item:
+                    self.by_base.pop(known_base, None)
             self._items[item] = (str(kind), str(base or ""))
             if base:
                 self.by_base[str(base)] = item
@@ -1565,7 +1669,24 @@ def stop_retry_proxy(
     for item in targets:
         if item is None:
             continue
+        stop = getattr(item, "stop", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception:
+                pass
+            continue
+        # A prep proxy is a raw ThreadingHTTPServer with no ``stop``; calling
+        # ``item.stop()`` raised AttributeError after the registry had already
+        # removed it, leaving the server accepting connections with no handle.
+        thread = getattr(item, "_gdp_thread", None)
         try:
-            item.stop()
-        except Exception:
+            item.shutdown()
+        except OSError:
             pass
+        try:
+            item.server_close()
+        except OSError:
+            pass
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)

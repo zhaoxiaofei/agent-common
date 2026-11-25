@@ -85,8 +85,9 @@ wrappers that check out the pinned submodule commit in all three checkouts.
 ## Public API and documentation
 
 See [`API.md`](API.md) for the supported imports and usage recipes.  Every
-public function and method has a docstring with an `Example` and a
-`Counterexample`, enforced by `test_public_api_docs.py`.
+public function and callable method has a docstring with an `Example` and a
+`Counterexample`, enforced by `test_public_api_docs.py`; public properties are
+covered by the class docstring and are not separate callables.
 
 ## Default reasoning levels
 
@@ -94,10 +95,13 @@ The catalog's `default_reasoning_level` is the one policy every harness reads
 when the operator sets no override; `check_model_catalog.py` pins it.  The
 generated DSH overlay and the Codex `-c` overrides resolve the same value
 through `model_runtime`, so a level cannot drift between a checkout and an
-adapter.  The Claude Code route applies the value only where the
-Anthropic-compatible endpoint documents the effort field (DeepSeek); the qwen
-and dots routes leave Claude Code's own effort setting untouched rather than
-send a field those endpoints do not document.
+adapter.  By default the Claude Code route applies the catalog value only where
+the Anthropic-compatible endpoint documents the effort field (DeepSeek); the
+qwen and dots routes leave Claude Code's own effort setting untouched rather
+than send a field those endpoints do not document.  An explicit
+`PAPER_AGENT_REASONING_EFFORT` override still sets
+`CLAUDE_CODE_EFFORT_LEVEL` for every family, including qwen and dots, exactly
+as the override contract below states.
 
 | Model | Default level | Where it is applied |
 | --- | --- | --- |

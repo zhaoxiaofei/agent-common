@@ -12,6 +12,7 @@ high, Qwen medium; GPT and Claude carry no level so their own default applies).
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import sys
@@ -65,6 +66,39 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _redacted_url(value: object) -> object:
+    """A URL safe to print in a diagnostic (never its credential)."""
+    if not isinstance(value, str):
+        return value
+    try:
+        from agent_common.model_runtime import redact_endpoint_url
+
+        return redact_endpoint_url(value)
+    except Exception:  # noqa: BLE001 - a checker reports, never crashes
+        # Last-resort textual scrub: keep the scheme/host/path and drop
+        # userinfo/query, including the malformed triple-slash spelling.
+        text = value.split("#", 1)[0].split("?", 1)[0]
+        if "://" in text:
+            scheme, _, rest = text.partition("://")
+            rest = rest.lstrip("/")
+            authority, separator, tail = rest.partition("/")
+            authority = authority.rsplit("@", 1)[-1]
+            return scheme + "://" + authority + separator + tail
+        if "@" in text:
+            return text.rsplit("@", 1)[-1]
+        return text
+
+
+def _iso_date(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def main() -> int:
     problems = []
     if not CANONICAL.is_file():
@@ -81,6 +115,9 @@ def main() -> int:
     if not isinstance(document, dict):
         print("FAIL canonical catalog is not a JSON object")
         return 1
+    updated_at = document.get("updated_at")
+    if not _iso_date(updated_at):
+        problems.append("bad updated_at %r" % (updated_at,))
     models = document.get("models", [])
     if not isinstance(models, list):
         print("FAIL canonical catalog models is not a list")
@@ -121,21 +158,31 @@ def main() -> int:
             or not all(isinstance(item, str) and item.strip() for item in sources)
         ):
             problems.append("%s: missing source provenance" % model_id)
-        if not entry.get("verified_at"):
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            problems.append("%s: bad name %r" % (model_id, name))
+        verified_at = entry.get("verified_at")
+        if not verified_at:
             problems.append("%s: missing verified_at" % model_id)
+        elif not _iso_date(verified_at):
+            problems.append("%s: bad verified_at %r" % (model_id, verified_at))
+        # The runtime treats a missing chat_max_tokens as optional (and removes
+        # it from the table); the checker used to require it, so a catalog the
+        # runtime accepted was rejected here.
         chat = entry.get("chat_max_tokens")
-        if type(chat) is not int or chat <= 0:
-            problems.append("%s: bad chat_max_tokens %r" % (model_id, chat))
-        elif type(context) is int and chat >= context:
-            problems.append(
-                "%s: chat_max_tokens %d does not fit context_window %d"
-                % (model_id, chat, context)
-            )
-        elif type(output) is int and chat < output:
-            problems.append(
-                "%s: chat_max_tokens %d is below max_tokens %d"
-                % (model_id, chat, output)
-            )
+        if chat is not None:
+            if type(chat) is not int or chat <= 0:
+                problems.append("%s: bad chat_max_tokens %r" % (model_id, chat))
+            elif type(context) is int and chat >= context:
+                problems.append(
+                    "%s: chat_max_tokens %d does not fit context_window %d"
+                    % (model_id, chat, context)
+                )
+            elif type(output) is int and chat < output:
+                problems.append(
+                    "%s: chat_max_tokens %d is below max_tokens %d"
+                    % (model_id, chat, output)
+                )
         # The runtime rejects these at import; the checker used to report OK
         # and exit 0 for a catalog the runtime could not load.
         base_url = entry.get("base_url")
@@ -148,16 +195,20 @@ def main() -> int:
                     host = parsed.hostname
                     port = parsed.port
                 except ValueError as exc:
-                    problems.append("%s: bad base_url %r (%s)" % (model_id, base_url, exc))
+                    problems.append(
+                        "%s: bad base_url %r (%s)"
+                        % (model_id, _redacted_url(base_url), exc)
+                    )
                 else:
                     if not host:
                         problems.append(
-                            "%s: base_url has no host: %r" % (model_id, base_url)
+                            "%s: base_url has no host: %r"
+                            % (model_id, _redacted_url(base_url))
                         )
                     elif port is not None and not 0 < port <= 65535:
                         problems.append(
                             "%s: base_url has an invalid port: %r"
-                            % (model_id, base_url)
+                            % (model_id, _redacted_url(base_url))
                         )
         for field in ("api_key_env", "provider"):
             value = entry.get(field)
@@ -211,6 +262,29 @@ def main() -> int:
         problems.append("missing expected model id %s" % model_id)
     for model_id in sorted(seen - EXPECTED_MODEL_IDS):
         problems.append("unexpected model id %s" % model_id)
+    # Finally, exercise the loader this checker protects rather than only the
+    # JSON shape: a catalog the runtime rejects (or interprets differently) must
+    # not print OK.
+    if not problems:
+        try:
+            from agent_common import model_runtime as runtime
+
+            models_table = {
+                name: dict(entry) for name, entry in runtime.AGENT_MODELS.items()
+            }
+            old_path = runtime._MODEL_CATALOG_PATH
+            old_secrets = dict(runtime._CATALOG_BASE_SECRETS)
+            try:
+                runtime._MODEL_CATALOG_PATH = CANONICAL
+                runtime._apply_model_catalog(models_table)
+            finally:
+                runtime._MODEL_CATALOG_PATH = old_path
+                runtime._CATALOG_BASE_SECRETS = old_secrets
+        except Exception as exc:  # noqa: BLE001 - a checker reports, never crashes
+            problems.append(
+                "the shared runtime does not accept this catalog: %s: %s"
+                % (type(exc).__name__, exc)
+            )
     if problems:
         for problem in problems:
             print("FAIL %s" % problem)

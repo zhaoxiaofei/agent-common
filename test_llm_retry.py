@@ -594,6 +594,44 @@ class DshOverlayIdleBoundTests(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertGreaterEqual(int(match.group(1)), needed_ms)
 
+    def test_the_idle_bound_covers_a_retry_after_cap_above_max_delay(self):
+        # A ``Retry-After`` hint may sleep up to ``retry_after_cap_seconds``,
+        # which can exceed ``max_delay_seconds``.  The old bound used only the
+        # exponential schedule, so it under-sized the watchdog.
+        policy = {
+            "retry": {
+                "initial_delay_seconds": 10,
+                "multiplier": 2,
+                "max_delay_seconds": 20,
+                "max_retries": 2,
+                "jitter_ratio": 0.1,
+                "retry_after_cap_seconds": 3600,
+                "retryable_http_statuses": [429],
+                "retryable_error_codes": ["RATE_LIMIT"],
+            },
+            "compaction": {"compaction_stream_idle_timeout_ms": 0},
+        }
+        schedule = RetrySchedule(policy)
+        per_retry = schedule.delay(1, retry_after=3600, jitter=False)
+        self.assertEqual(per_retry, 3600.0)
+        needed_ms = int(
+            (
+                per_retry * schedule.max_retries * (1.0 + schedule.jitter_ratio)
+                + (schedule.max_retries + 1) * 600.0
+            )
+            * 1000
+        )
+        overlay = dots_dsh_overlay(
+            policy,
+            model="dots3-note-prev",
+            base_url="https://note3-prev-api.askdiandian.com/v1",
+            context_window=393000,
+            max_tokens=65536,
+        )
+        match = re.search(r"streamIdleTimeoutMs:\s*(\d+)", overlay)
+        self.assertIsNotNone(match)
+        self.assertGreaterEqual(int(match.group(1)), needed_ms)
+
     def test_an_explicit_longer_idle_override_still_wins(self):
         overlay = dots_dsh_overlay(
             model="dots3-note-prev",

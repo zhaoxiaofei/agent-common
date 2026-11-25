@@ -11,9 +11,11 @@ sys.path.insert(0, "/path/to/checkout/agent-common")
 from agent_common import chat, dsh_events, model_runtime, llm_retry, agent_cli
 ```
 
-Every public function and method has a docstring with at least one `Example`
-and one `Counterexample`; `test_public_api_docs.py` enforces that contract.
-Names beginning with `_` are private and may change without notice.
+Every public function and callable method has a docstring with at least one
+`Example` and one `Counterexample`; `test_public_api_docs.py` enforces that
+contract.  Public properties are part of their class docstring rather than
+separate callables.  Names beginning with `_` are private and may change
+without notice.
 
 ## `model_runtime` — model/harness/provider resolution
 

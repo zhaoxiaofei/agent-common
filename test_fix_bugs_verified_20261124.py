@@ -40,22 +40,23 @@ class EffectiveAgentModelRedactionTests(unittest.TestCase):
 class RouteRawModelRedactionTests(unittest.TestCase):
     """F02: Codex argv and Claude argv/environment must not emit raw_model."""
 
-    def test_codex_args_claude_arg_and_claude_env_redact_raw_model(self):
+    def test_codex_and_claude_reject_a_raw_endpoint_model(self):
+        # A raw http(s) URL is a custom endpoint, never a provider model id;
+        # both routes reject it rather than emitting the URL as the model.
         codex = model_runtime.resolve_agent_selection(
             harness="gpt-codex", model="deepseek-flash"
         )
-        args = model_runtime.codex_provider_args(codex, raw_model=URL)
-        self.assertIn('-c', args)
-        self.assertIn('model="%s"' % SAFE, args)
-        self.assertNotIn("SECRET", " ".join(args))
+        with self.assertRaises(model_runtime.ConfigError) as caught:
+            model_runtime.codex_provider_args(codex, raw_model=URL)
+        self.assertNotIn("SECRET", str(caught.exception))
 
         claude = model_runtime.resolve_agent_selection(
             harness="claude-code", model="qwen38-27b"
         )
-        self.assertEqual(model_runtime.claude_model_arg(claude, raw_model=URL), SAFE)
-        env = model_runtime.claude_environment(claude, raw_model=URL)
-        self.assertEqual(env["ANTHROPIC_MODEL"], SAFE)
-        self.assertNotIn("SECRET", json.dumps(env))
+        with self.assertRaises(model_runtime.ConfigError):
+            model_runtime.claude_model_arg(claude, raw_model=URL)
+        with self.assertRaises(model_runtime.ConfigError):
+            model_runtime.claude_environment(claude, raw_model=URL)
 
 
 class SchemeLessUserinfoRedactionTests(unittest.TestCase):
@@ -121,26 +122,21 @@ class DotsOverlayCredentialTests(unittest.TestCase):
             ],
         )
 
-    def test_a_hostless_userinfo_value_is_scrubbed_too(self):
-        # R02: without a scheme the value is still a credential-bearing
-        # ``userinfo@host/path``; only the authority userinfo must go.
+    def test_a_hostless_userinfo_value_is_rejected(self):
+        # A value without an http(s) scheme/host cannot route; it must be
+        # rejected (credential-free) instead of emitted as ``baseURL``.
         for value in ("user:pw@host/v1", "user:pw@host/v1?api_key=QKEY"):
             with self.subTest(value=value):
-                overlay = llm_retry.dots_dsh_overlay(
-                    None,
-                    model="dots3-note-prev",
-                    base_url=value,
-                    context_window=393000,
-                    max_tokens=65536,
-                )
-                self.assertNotIn("pw", overlay)
-                self.assertNotIn("QKEY", overlay)
-                base_lines = [
-                    line.strip() for line in overlay.splitlines() if "baseURL" in line
-                ]
-                self.assertEqual(
-                    base_lines, ['baseURL: "host/v1"', 'baseURL: "host/v1"']
-                )
+                with self.assertRaises(ValueError) as caught:
+                    llm_retry.dots_dsh_overlay(
+                        None,
+                        model="dots3-note-prev",
+                        base_url=value,
+                        context_window=393000,
+                        max_tokens=65536,
+                    )
+                self.assertNotIn("pw", str(caught.exception))
+                self.assertNotIn("QKEY", str(caught.exception))
 
 
 class ClaudeMissingKeyTests(unittest.TestCase):
