@@ -16,10 +16,12 @@ paper-refine root.
 from __future__ import annotations
 
 import copy
+import datetime
 import email.utils
 import http.client
 import http.server
 import json
+import re
 import math
 import random
 import ssl
@@ -230,12 +232,25 @@ def _merge_policy(document: Mapping[str, Any]) -> Dict[str, Any]:
             {key: value for key, value in incoming.items() if value is not None}
         )
     retry = policy["retry"]
-    retry["initial_delay_seconds"] = float(retry["initial_delay_seconds"])
-    retry["multiplier"] = float(retry["multiplier"])
-    retry["max_delay_seconds"] = float(retry["max_delay_seconds"])
+    for key in (
+        "initial_delay_seconds",
+        "multiplier",
+        "max_delay_seconds",
+        "jitter_ratio",
+        "retry_after_cap_seconds",
+    ):
+        value = retry[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("retry.%s must be a number, not %r" % (key, value))
+        retry[key] = float(value)
+    if isinstance(retry["max_retries"], bool) or not isinstance(
+        retry["max_retries"], int
+    ):
+        raise ValueError(
+            "retry.max_retries must be an integer, not %r"
+            % (retry["max_retries"],)
+        )
     retry["max_retries"] = int(retry["max_retries"])
-    retry["jitter_ratio"] = float(retry["jitter_ratio"])
-    retry["retry_after_cap_seconds"] = float(retry["retry_after_cap_seconds"])
     # ``or []`` treated a present-but-empty mapping/string as absent before
     # the type check, so ``{}`` or ``""`` loaded "successfully" and disabled
     # every retry.  Absent (or null, which the merge drops) keeps the
@@ -244,11 +259,26 @@ def _merge_policy(document: Mapping[str, Any]) -> Dict[str, Any]:
     statuses = retry.get("retryable_http_statuses")
     if not isinstance(statuses, (list, tuple)):
         raise ValueError("retry.retryable_http_statuses must be a list of integers")
+    for status in statuses:
+        # ``int()`` accepted True (1), 1.9 (1) and "429" (429), silently
+        # changing the retry set a malformed policy asked for.
+        if isinstance(status, bool) or not isinstance(status, int):
+            raise ValueError(
+                "retry.retryable_http_statuses must contain integers, not %r"
+                % (status,)
+            )
     retry["retryable_http_statuses"] = sorted({int(status) for status in statuses})
     codes = retry.get("retryable_error_codes")
     if not isinstance(codes, (list, tuple)):
         raise ValueError("retry.retryable_error_codes must be a list of strings")
-    retry["retryable_error_codes"] = sorted({str(code) for code in codes if code})
+    for code in codes:
+        # ``str(1)`` used to turn a numeric typo into the code "1".
+        if not isinstance(code, str):
+            raise ValueError(
+                "retry.retryable_error_codes must contain strings, not %r"
+                % (code,)
+            )
+    retry["retryable_error_codes"] = sorted({code for code in codes if code})
     for key in (
         "initial_delay_seconds",
         "multiplier",
@@ -569,6 +599,10 @@ def retry_after_seconds(headers: Optional[Mapping[str, str]]) -> Optional[float]
         return None
     if parsed is None:
         return None
+    if parsed.tzinfo is None:
+        # HTTP-date is GMT by definition; a provider that omits the zone must
+        # not have its delay interpreted in the host's local timezone.
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
     return max(0.0, parsed.timestamp() - time.time())
 
 
@@ -797,10 +831,13 @@ _CREDENTIAL_QUERY_NAMES = frozenset(
         "clientsecret",
         "clientsecrets",
         "password",
+        "passwords",
         "passwd",
+        "passwds",
         "credential",
         "credentials",
         "authorization",
+        "authorizations",
         "auth",
         "bearer",
         "accesskey",
@@ -844,11 +881,26 @@ def _credential_query_key(name: Any) -> bool:
 
 
 def _reject_dot_segments(path: str) -> None:
-    """Reject ``.``/``..`` segments before they escape the proxy prefix."""
-    decoded = urllib.parse.unquote(str(path or ""))
+    """Reject ``.``/``..`` segments before they escape the proxy prefix.
+
+    A single ``unquote`` let a double-encoded ``%252e%252e`` through; the
+    upstream may decode it once more and resolve ``..`` outside the prefix.
+    Decode repeatedly until stable, then refuse any residual encoded dot,
+    slash or backslash.
+    """
+    decoded = str(path or "")
+    for _attempt in range(8):
+        candidate = urllib.parse.unquote(decoded)
+        if candidate == decoded:
+            break
+        decoded = candidate
     if any(segment in (".", "..") for segment in decoded.split("/")):
         raise ValueError(
             "request target must not contain '.' or '..' path segments"
+        )
+    if re.search(r"(?i)%2e|%2f|%5c", decoded):
+        raise ValueError(
+            "request target must not contain encoded '.' or path separators"
         )
 
 
@@ -1162,13 +1214,18 @@ def retry_policy_yaml(policy: Optional[Mapping[str, Any]] = None, indent: str = 
     """
     document = _merge_policy(policy or load_policy())
     retry = document["retry"]
+    codes = list(retry["retryable_error_codes"])
     lines = [
         "%sretryPolicy:" % indent,
         "%s  mode: normal" % indent,
         "%s  maxRetries: %d" % (indent, int(retry["max_retries"])),
-        "%s  retryableCodes:" % indent,
+        (
+            "%s  retryableCodes:" % indent
+            if codes
+            else "%s  retryableCodes: []" % indent
+        ),
     ]
-    for code in retry["retryable_error_codes"]:
+    for code in codes:
         # The scalar emitter quotes and escapes a code containing a colon,
         # newline or YAML boolean spelling so it cannot change the document shape.
         lines.append("%s    - %s" % (indent, _yaml_scalar(code)))
@@ -1315,13 +1372,14 @@ def _yaml_scalar(value: Any) -> str:
 
 
 def _overlay_base_url(value: Any) -> str:
-    """A persisted, routable base URL with userinfo, query and fragment removed.
+    """A persisted, routable base URL with userinfo and credential query removed.
 
     ``dots_dsh_overlay`` is a public generator, so a direct caller can pass a
     credential-bearing ``PAPER_*_BASE_URL``-shaped value.  The generated
     ``dsh_model_patch.yml`` is agent-readable; keep the live credential out of
-    it, matching ``model_runtime.endpoint_base``.  This module stays standalone
-    (no sibling import), so the normalisation is local.
+    it, matching ``model_runtime.endpoint_base``.  A non-secret query parameter
+    (``api-version=2024``) is kept.  This module stays standalone (no sibling
+    import), so the normalisation is local.
 
     A value without an http(s) scheme and host cannot route, so it raises
     ``ValueError`` (credential-free) instead of being emitted as ``baseURL``.
@@ -1343,7 +1401,20 @@ def _overlay_base_url(value: Any) -> str:
     path = parsed.path.rstrip("/")
     if path.endswith("/chat/completions"):
         path = path[: -len("/chat/completions")].rstrip("/")
-    return urllib.parse.urlunsplit((parsed.scheme, netloc, path, "", ""))
+    # A gateway may require a non-secret query parameter; keep it (and drop
+    # only credential-named values) so the generated baseURL stays routable.
+    try:
+        kept = [
+            (key, value)
+            for key, value in urllib.parse.parse_qsl(
+                parsed.query.replace(";", "&"), keep_blank_values=True
+            )
+            if not _credential_query_key(key)
+        ]
+    except ValueError:
+        kept = []
+    query = urllib.parse.urlencode(kept, doseq=True) if kept else ""
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, path, query, ""))
 
 
 def dots_dsh_overlay(

@@ -67,13 +67,32 @@ def digest(path: Path) -> str:
 
 
 def _redacted_url(value: object) -> object:
-    """A URL safe to print in a diagnostic (never its credential)."""
+    """A URL safe to print in a diagnostic (never its credential).
+
+    A non-secret query parameter is kept: dropping the whole query made
+    ``?api-version=2023`` and ``?api-version=2024`` print identically, hiding
+    the drift this checker reports.
+    """
     if not isinstance(value, str):
         return value
     try:
-        from agent_common.model_runtime import redact_endpoint_url
+        from agent_common.model_runtime import _credential_key, redact_endpoint_url
 
-        return redact_endpoint_url(value)
+        safe = redact_endpoint_url(value)
+        try:
+            query = urllib.parse.urlsplit(value).query
+        except ValueError:
+            query = ""
+        kept = [
+            (key, item)
+            for key, item in urllib.parse.parse_qsl(
+                query.replace(";", "&"), keep_blank_values=True
+            )
+            if not _credential_key(key)
+        ]
+        if kept:
+            safe += "?" + urllib.parse.urlencode(kept, doseq=True)
+        return safe
     except Exception:  # noqa: BLE001 - a checker reports, never crashes
         # Last-resort textual scrub: keep the scheme/host/path and drop
         # userinfo/query, including the malformed triple-slash spelling.

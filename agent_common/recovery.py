@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import threading
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -60,14 +61,203 @@ DEFAULT_FAIL_TIER = TIER_CRITICAL
 THRESHOLD_EXIT_CODE = 6
 
 _CODE_RE = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$")
-_SECRET_KEY_RE = re.compile(
-    r"(?:api[_-]?key|secret|token|password|passwd|authorization|cookie|credential)",
-    re.IGNORECASE,
+
+#: Credential-looking names, normalised by lowercasing and dropping every
+#: non-alphanumeric character.  ``recovery`` deliberately stays dependency-free,
+#: so this mirrors ``model_runtime._credential_key`` instead of importing it.
+#: Generation counters (``max_tokens``, ``prompt_tokens``, ...) are *not*
+#: credentials and stay readable: only the singular ``token`` spelling and the
+#: ``_token`` suffix are secrets.
+_CREDENTIAL_KEY_NAMES = frozenset(
+    {
+        "key",
+        "apikey",
+        "apikeys",
+        "xapikey",
+        "token",
+        "accesstoken",
+        "accesstokens",
+        "authtoken",
+        "authtokens",
+        "apitoken",
+        "apitokens",
+        "secret",
+        "secrets",
+        "secretkey",
+        "secretkeys",
+        "privatekey",
+        "privatekeys",
+        "clientsecret",
+        "clientsecrets",
+        "password",
+        "passwords",
+        "passwd",
+        "passwds",
+        "credential",
+        "credentials",
+        "authorization",
+        "authorizations",
+        "auth",
+        "bearer",
+        "accesskey",
+        "accesskeys",
+        "accesskeyid",
+        "subscriptionkey",
+        "signature",
+        "signatures",
+        "sig",
+        "sigs",
+        "cookie",
+        "cookies",
+        "refreshtoken",
+        "refreshtokens",
+    }
 )
-_SECRET_TEXT_RE = re.compile(
-    r"(?i)\b(api[_-]?key|secret|token|password|passwd|authorization)\b(\s*[:=]\s*)"
-    r"([^\s,;]+)"
+_CREDENTIAL_KEY_SUFFIXES = (
+    "_key",
+    "_token",
+    "_secret",
+    "_password",
+    "_passwd",
+    "_credential",
+    "_credentials",
+    "_authorization",
+    "_auth",
+    "_apikey",
+    "_signature",
+    "_sig",
+    "_cookie",
 )
+
+
+def _credential_key(name: Any) -> bool:
+    """Whether a mapping/assignment key looks like it carries a credential."""
+    text = str(name or "").strip().lower()
+    compact = "".join(character for character in text if character.isalnum())
+    if compact in _CREDENTIAL_KEY_NAMES:
+        return True
+    normalized = text.replace("-", "_").replace(" ", "_")
+    return normalized.endswith(_CREDENTIAL_KEY_SUFFIXES)
+
+
+#: The key/separator of a credential assignment in free text (``token=...``,
+#: ``"api_key": "..."`` or ``Authorization: Bearer ...``).  Only one key (one
+#: token, or one quoted phrase) and the separator are consumed: the caller
+#: keeps scanning the value, so an outer non-credential assignment such as
+#: ``body=api_key=SECRET`` cannot swallow the nested credential, and a
+#: preceding word cannot become the key.
+_ASSIGNMENT_KEY_RE = re.compile(
+    r"(?i)(?<![\w.-])"
+    r"(?:(?P<quote>[\"'])(?P<quoted>[^\"'\n]{1,80})(?P=quote)"
+    r"|(?P<key>[A-Za-z0-9_.-]{1,80}))"
+    r"(?P<sep>\s*[:=]\s*)"
+)
+#: The scalar value that follows a credential assignment key.
+_ASSIGNMENT_VALUE_RE = re.compile(
+    r"(?i)(?:(?:bearer|basic)\s+)?"
+    r"(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s,;}{]+)"
+)
+_URL_RE = re.compile(r"(?i)\b(?:https?|ftp)://[^\s'\"<>]+")
+_BEARER_RE = re.compile(
+    r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]{6,})"
+)
+
+
+def _query_pairs(query: str) -> List[Tuple[str, str]]:
+    try:
+        return urllib.parse.parse_qsl(
+            str(query or "").replace(";", "&"), keep_blank_values=True
+        )
+    except ValueError:
+        return []
+
+
+def _redact_url(text: str) -> str:
+    """Mask URL userinfo and credential-named query values in one string."""
+    raw = str(text)
+    if "://" not in raw:
+        return raw
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        # An unparsable URL still must not leak its credential-bearing parts.
+        without_fragment = raw.split("#", 1)[0]
+        head, _separator, _query = without_fragment.partition("?")
+        if "@" in head:
+            scheme, separator, remainder = head.partition("://")
+            return scheme + separator + "<redacted>@" + remainder.rsplit("@", 1)[-1]
+        return head
+    if not parsed.scheme or not parsed.netloc:
+        return raw
+    netloc = parsed.netloc
+    if "@" in netloc:
+        netloc = "<redacted>@" + netloc.rsplit("@", 1)[-1]
+    kept = [
+        (key, "<redacted>" if _credential_key(key) else value)
+        for key, value in _query_pairs(parsed.query)
+    ]
+    query = urllib.parse.urlencode(kept, doseq=True) if kept else ""
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, netloc, parsed.path, query, parsed.fragment)
+    )
+
+
+def _redact_assignment_value(value: str) -> str:
+    """Mask a scalar assignment value, preserving surrounding quotes."""
+    if value[:1] in ("'", '"') and value[-1:] == value[:1]:
+        return "%s<redacted>%s" % (value[0], value[0])
+    return "<redacted>"
+
+
+def _redact_assignments(text: str) -> str:
+    """Mask credential assignments, including ones nested inside a value.
+
+    Example: ``body=api_key=SECRET`` becomes ``body=api_key=<redacted>``.
+
+    Counterexample: ``max_tokens=512`` is a generation counter, not a
+    credential, and stays readable.
+    """
+    pieces = []
+    position = 0
+    while True:
+        match = _ASSIGNMENT_KEY_RE.search(text, position)
+        if match is None:
+            pieces.append(text[position:])
+            return "".join(pieces)
+        pieces.append(text[position : match.end()])
+        key = match.group("quoted") or match.group("key")
+        if _credential_key(key):
+            value = _ASSIGNMENT_VALUE_RE.match(text, match.end())
+            if value is not None:
+                pieces.append(_redact_assignment_value(value.group(0)))
+                position = value.end()
+                continue
+        position = match.end()
+
+
+def _redact_bearer(match: "re.Match[str]") -> str:
+    """Mask a credential-shaped Bearer/Basic token, not ordinary prose.
+
+    A real header value (``Authorization: Bearer <token>``) is handled by the
+    key-aware assignment pass, so this pass only needs to recognise tokens that
+    have a credential shape: a digit/symbol, or a long mixed-case run.  Plain
+    words such as "configuration", "authentication" and "token" stay readable.
+    """
+    token = match.group(2)
+    prose_word = token.isalpha() and token.islower()
+    if match.group(1).lower() == "bearer" and not prose_word:
+        # "Bearer" is a credential scheme far more often than an English
+        # adjective, so a non-lowercase word after it is treated as a token.
+        return "%s <redacted>" % match.group(1)
+    credential_shaped = (
+        any(not character.isalnum() for character in token)
+        or any(character.isdigit() for character in token)
+        or (_credential_key(token) and not token.islower())
+        or (len(token) >= 16 and not (token.islower() or token.isupper()))
+    )
+    if not credential_shaped:
+        return match.group(0)
+    return "%s <redacted>" % match.group(1)
 
 #: Outcomes a recovery record may state.  They are deliberately distinct so a
 #: reader can tell "continued unchanged" from "degraded with omissions".
@@ -271,23 +461,27 @@ def redact_value(value: Any) -> Any:
     Example: ``redact_value({"api_key": "sk-1"})`` returns
     ``{"api_key": "<redacted>"}``.
 
-    Counterexample: redaction is not a substitute for not collecting a secret;
-    a secret embedded in a free-text message can still survive.
+    Counterexample: a generation counter such as ``max_tokens`` is not a
+    credential and stays readable; a credential-bearing URL under an ordinary
+    key (``endpoint``) is still reduced to its credential-free shell.
     """
     if isinstance(value, Mapping):
         result = {}
         for key, item in value.items():
-            if isinstance(key, str) and _SECRET_KEY_RE.search(key):
+            if isinstance(key, str) and _credential_key(key):
                 result[key] = "<redacted>"
             else:
                 result[key] = redact_value(item)
         return result
     if isinstance(value, (list, tuple)):
         return [redact_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_url(value)
     return value
 
 
 _LINE_BREAK_RE = re.compile(r"[\x00-\x1f\x7f\u2028\u2029]+")
+_BACKTICK_RUN_RE = re.compile(r"`+")
 
 
 def _one_line(text: Any) -> str:
@@ -295,8 +489,34 @@ def _one_line(text: Any) -> str:
     return _LINE_BREAK_RE.sub(" ", str(text)).strip()
 
 
+def _inline_code(text: Any) -> str:
+    """Render ``text`` as a CommonMark code span that cannot close early.
+
+    Example: ``_inline_code("a`b")`` uses a two-backtick fence because the
+    value contains a one-backtick run.
+
+    Counterexample: ``_inline_code("plain")`` uses the usual single fence.
+    """
+    value = str(text)
+    longest = max(
+        (len(run.group(0)) for run in _BACKTICK_RUN_RE.finditer(value)),
+        default=0,
+    )
+    fence = "`" * (longest + 1)
+    # A fence abutting a value that starts/ends with a backtick would be read
+    # as one longer run; one padding space keeps the fence separate (CommonMark
+    # strips the single padding space again inside the code span).
+    pad = " " if value.startswith("`") or value.endswith("`") else ""
+    return "%s%s%s%s%s" % (fence, pad, value, pad, fence)
+
+
 def redact_text(text: str) -> str:
-    """Mask ``key=value``-shaped credentials in a free-text diagnostic message.
+    """Mask credentials in a free-text diagnostic message.
+
+    URL userinfo, credential-named query values, ``Bearer``/``Basic`` tokens,
+    JSON/quoted assignments and plural or spaced credential names are masked.
+    Ordinary prose ("the token expired") and generation counters such as
+    ``max_tokens=512`` are left alone.
 
     Example: ``redact_text("token=abc123 failed")`` returns
     ``"token=<redacted> failed"``.
@@ -304,7 +524,12 @@ def redact_text(text: str) -> str:
     Counterexample: prose such as "the token expired" is unchanged; there is
     no assignment value to mask.
     """
-    return _SECRET_TEXT_RE.sub(lambda match: "%s%s<redacted>" % (match.group(1), match.group(2)), str(text))
+    def _url(match: "re.Match[str]") -> str:
+        return _redact_url(match.group(0))
+
+    redacted = _URL_RE.sub(_url, str(text))
+    redacted = _BEARER_RE.sub(_redact_bearer, redacted)
+    return _redact_assignments(redacted)
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +680,17 @@ class RecoveryRecord:
             "remaining_uncertainty",
             "output_effects",
         ):
-            setattr(self, name, _one_line(getattr(self, name) or ""))
+            setattr(
+                self,
+                name,
+                redact_text(_one_line(getattr(self, name) or "")),
+            )
+        for name in ("omissions", "substitutions", "affected_outputs"):
+            setattr(
+                self,
+                name,
+                [redact_text(item) for item in (getattr(self, name) or ())],
+            )
         self.context = redact_value(dict(self.context or {}))
 
     @property
@@ -581,6 +816,23 @@ def new_run_id(prefix: str = "run") -> str:
     return "%s-%s-%s" % (prefix, stamp, uuid.uuid4().hex[:8])
 
 
+def _single_path_component(value: Any, what: str) -> str:
+    """Reject a run id/filename that would escape its journal directory."""
+    text = str(value or "")
+    if (
+        not text
+        or text in (".", "..")
+        or "\x00" in text
+        or os.path.isabs(text)
+        or os.sep in text
+        or (os.altsep is not None and os.altsep in text)
+    ):
+        raise RecoveryPolicyError(
+            "%s must be a single path component, got %r" % (what, value)
+        )
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Incremental journal
 # ---------------------------------------------------------------------------
@@ -625,6 +877,42 @@ def record_sequence(item: Any) -> int:
         return 0
 
 
+def _json_safe(value: Any, _seen: Optional[set] = None) -> Any:
+    """Convert an arbitrary value to something ``json.dumps`` can serialize.
+
+    A diagnostic context may carry a ``Path``, a set or a caller object.  The
+    journal promises a failed write never raises, and a raw ``TypeError`` from
+    ``json.dumps`` violated that promise; non-JSON values are converted instead
+    of aborting the incident path.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    seen = _seen if _seen is not None else set()
+    if isinstance(value, Mapping):
+        marker = id(value)
+        if marker in seen:
+            return "<cycle>"
+        seen.add(marker)
+        try:
+            return {
+                str(key): _json_safe(item, seen) for key, item in value.items()
+            }
+        finally:
+            seen.discard(marker)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        marker = id(value)
+        if marker in seen:
+            return "<cycle>"
+        seen.add(marker)
+        try:
+            return [_json_safe(item, seen) for item in value]
+        finally:
+            seen.discard(marker)
+    if isinstance(value, Path):
+        return str(value)
+    return _one_line(repr(value))
+
+
 class RecoveryJournal:
     """Append-only JSONL recovery journal with a documented local fallback.
 
@@ -652,16 +940,19 @@ class RecoveryJournal:
         clock: Optional[Callable[[], _dt.datetime]] = None,
     ) -> None:
         self.directory = Path(directory)
-        self.run_id = run_id
-        self.filename = filename
+        self.run_id = _single_path_component(run_id, "run_id")
+        self.filename = _single_path_component(filename, "filename")
         self.fallback_directory = (
             Path(fallback_directory) if fallback_directory is not None else None
         )
         self.clock = clock
-        self.events_path = self.directory / filename
+        self.events_path = self.directory / self.filename
         self.run_path = self.directory / "run.json"
         self._lock = threading.RLock()
         self._sequence = 0
+        self._sequence_seeded = False
+        self._event_ids: set = set()
+        self._started_at: Optional[str] = None
         self.metadata: Dict[str, Any] = {}
         self.status = "not_started"
         self.audit_errors: List[Dict[str, Any]] = []
@@ -679,10 +970,12 @@ class RecoveryJournal:
         pretend the journal was started.
         """
         self.metadata = redact_value(dict(metadata or {}))
+        started_at = _timestamp(self.clock)
+        self._started_at = started_at
         manifest = {
             "run_id": self.run_id,
             "status": "in_progress",
-            "started_at": _timestamp(self.clock),
+            "started_at": started_at,
             "finished_at": None,
             "metadata": self.metadata,
             "events_file": str(self.events_path),
@@ -692,14 +985,49 @@ class RecoveryJournal:
         }
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
-            _atomic_write_text(self.run_path, json.dumps(manifest, indent=2, sort_keys=True))
+            _atomic_write_text(
+                self.run_path,
+                json.dumps(_json_safe(manifest), indent=2, sort_keys=True),
+            )
             self.status = "in_progress"
             return True
-        except OSError as exc:
+        except (OSError, TypeError, ValueError) as exc:
             self._record_audit_error("JOURNAL_START_FAILED", exc)
             self._fallback_manifest(manifest)
             self.status = "in_progress"
             return False
+
+    def _seed_sequence(self) -> None:
+        """Start numbering after the records an earlier process already wrote."""
+        if self._sequence_seeded:
+            return
+        self._sequence_seeded = True
+        highest = 0
+        known = set()
+        paths = [self.events_path]
+        if self.fallback_directory is not None:
+            paths.append(self.fallback_directory / self.filename)
+        for path in paths:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                highest = max(highest, record_sequence(entry))
+                event_id = str(entry.get("event_id") or "")
+                if event_id:
+                    known.add(event_id)
+                    match = re.search(r"-(\d+)$", event_id)
+                    if match:
+                        highest = max(highest, int(match.group(1)))
+        self._event_ids = known
+        self._sequence = max(self._sequence, highest)
 
     def next_event_id(self) -> str:
         """Allocate the next stable event identifier for this run.
@@ -710,6 +1038,7 @@ class RecoveryJournal:
         collide when two threads record events in the same instant.
         """
         with self._lock:
+            self._seed_sequence()
             self._sequence += 1
             return "%s-%04d" % (self.run_id, self._sequence)
 
@@ -724,18 +1053,36 @@ class RecoveryJournal:
         """
         payload = dict(record)
         with self._lock:
+            self._seed_sequence()
             self._sequence = max(self._sequence, record_sequence(payload))
+            event_id = str(payload.get("event_id") or "")
+            if event_id and event_id in self._event_ids:
+                # Reopening a run must not overwrite the earlier event under
+                # the same id (``records`` keeps only the first occurrence).
+                replacement = self.next_event_id()
+                self._record_audit_error(
+                    "JOURNAL_EVENT_ID_REUSED",
+                    ValueError(
+                        "event id %r already exists; reassigned %r"
+                        % (event_id, replacement)
+                    ),
+                )
+                payload["event_id"] = replacement
+            if payload.get("event_id"):
+                self._event_ids.add(str(payload["event_id"]))
             try:
                 self.directory.mkdir(parents=True, exist_ok=True)
                 self._append_line(self.events_path, payload)
                 return True
-            except OSError as exc:
+            except (OSError, TypeError, ValueError) as exc:
                 self.pending.append(payload)
                 self._record_audit_error("JOURNAL_WRITE_FAILED", exc)
                 return self._write_fallback(payload)
 
     def _append_line(self, path: Path, payload: Mapping[str, Any]) -> None:
-        line = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        line = json.dumps(
+            _json_safe(dict(payload)), sort_keys=True, ensure_ascii=False
+        )
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(line + "\n")
             handle.flush()
@@ -748,7 +1095,7 @@ class RecoveryJournal:
             self.fallback_directory.mkdir(parents=True, exist_ok=True)
             self._append_line(self.fallback_directory / self.filename, payload)
             return True
-        except OSError as exc:
+        except (OSError, TypeError, ValueError) as exc:
             self._record_audit_error("JOURNAL_FALLBACK_FAILED", exc)
             return False
 
@@ -759,9 +1106,11 @@ class RecoveryJournal:
             self.fallback_directory.mkdir(parents=True, exist_ok=True)
             _atomic_write_text(
                 self.fallback_directory / ("%s-run.json" % self.run_id),
-                json.dumps(dict(manifest), indent=2, sort_keys=True),
+                json.dumps(
+                    _json_safe(dict(manifest)), indent=2, sort_keys=True
+                ),
             )
-        except OSError as exc:
+        except (OSError, TypeError, ValueError) as exc:
             self._record_audit_error("JOURNAL_MANIFEST_FALLBACK_FAILED", exc)
 
     def _record_audit_error(self, code: str, exc: BaseException) -> None:
@@ -840,7 +1189,9 @@ class RecoveryJournal:
         manifest = {
             "run_id": self.run_id,
             "status": status,
-            "started_at": (self.metadata or {}).get("started_at") or None,
+            "started_at": self._started_at
+            or (self.metadata or {}).get("started_at")
+            or None,
             "finished_at": _timestamp(self.clock),
             "exit_code": exit_code,
             "metadata": self.metadata,
@@ -852,16 +1203,32 @@ class RecoveryJournal:
             "pending_events": len(self.pending),
         }
         if not manifest["started_at"]:
-            try:
-                existing = json.loads(self.run_path.read_text(encoding="utf-8"))
-                manifest["started_at"] = existing.get("started_at")
-            except (OSError, ValueError):
-                pass
+            for path in (
+                self.run_path,
+                (
+                    self.fallback_directory / ("%s-run.json" % self.run_id)
+                    if self.fallback_directory is not None
+                    else None
+                ),
+            ):
+                if path is None:
+                    continue
+                try:
+                    existing = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if isinstance(existing, Mapping):
+                    manifest["started_at"] = existing.get("started_at")
+                if manifest["started_at"]:
+                    break
         self.status = status
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
-            _atomic_write_text(self.run_path, json.dumps(manifest, indent=2, sort_keys=True))
-        except OSError as exc:
+            _atomic_write_text(
+                self.run_path,
+                json.dumps(_json_safe(manifest), indent=2, sort_keys=True),
+            )
+        except (OSError, TypeError, ValueError) as exc:
             self._record_audit_error("JOURNAL_FINALIZE_FAILED", exc)
             self._fallback_manifest(manifest)
         return manifest
@@ -881,7 +1248,7 @@ class RecoveryJournal:
             paths.append(self.fallback_directory / self.filename)
         for path in paths:
             try:
-                text = path.read_text(encoding="utf-8")
+                text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
             for line in text.splitlines():
@@ -907,6 +1274,16 @@ class RecoveryJournal:
 
 _SECTION_START = "<!-- recovery-run:%s -->"
 _SECTION_END = "<!-- /recovery-run:%s -->"
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+
+
+def _neutralize_markers(text: str) -> str:
+    """Escape managed-section markers embedded in user/agent-authored text."""
+    return (
+        str(text)
+        .replace("<!-- /recovery-run:", "&lt;!-- /recovery-run:")
+        .replace("<!-- recovery-run:", "&lt;!-- recovery-run:")
+    )
 
 
 class MarkdownReport:
@@ -944,7 +1321,7 @@ class MarkdownReport:
         :class:`ReportWriteError` rather than discarding history.
         """
         try:
-            return self.path.read_text(encoding="utf-8")
+            return self.path.read_text(encoding="utf-8", errors="replace")
         except FileNotFoundError:
             return ""
         except OSError as exc:
@@ -960,6 +1337,14 @@ class MarkdownReport:
         callers must not supply their own section markers.
         """
         text = self.read() or "# %s\n" % self.title
+        if not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id):
+            raise RecoveryPolicyError(
+                "run id %r is not a safe report section identifier" % (run_id,)
+            )
+        # Record prose is agent-authored.  An embedded managed-section marker
+        # would split the next upsert and leave attacker-chosen text outside
+        # the section, so display it as escaped text instead.
+        body = _neutralize_markers(str(body))
         start = _SECTION_START % run_id
         end = _SECTION_END % run_id
         section = "%s\n%s\n%s" % (start, body.rstrip(), end)
@@ -1233,8 +1618,17 @@ class RecoveryController:
                 context=diagnostic.record_context(),
             )
             self.records.append(record)
+            persisted = True
             if journal and self.journal is not None:
-                self.journal.append(record.to_dict())
+                persisted = self.journal.append(record.to_dict())
+            if not persisted:
+                # The threshold stop is still enforced, but a reader must not
+                # believe the record reached the durable journal.
+                self._log_text(
+                    "TIER-WARNING-AUDIT_WRITE_FAILED: %s record retained only "
+                    "in memory/pending; the configured fail-tier stop still "
+                    "applies" % record.code
+                )
             self._log(record)
         if self.report_callback is not None:
             try:
@@ -1350,6 +1744,11 @@ class RecoveryController:
         for attempt in range(1, max_attempts + 1):
             try:
                 value = function(attempt)
+                if attempt == 1:
+                    # Nothing failed: recording "recovered" would inflate the
+                    # audit and make the fail-tier policy stop a successful
+                    # operation.
+                    return RecoveryResult(True, value, False, None, attempt, None)
                 record = self.emit(
                     Diagnostic(
                         diagnostic.tier,
@@ -1478,9 +1877,10 @@ class RecoveryController:
         """Run one work item and convert an unexpected exception into a record.
 
         This is the work-boundary recovery required by the shared policy: one
-        failed item does not terminate unrelated processing.  The diagnostic is
-        emitted (and therefore subject to the fail tier), then the optional
-        fallback runs; without a fallback the result is simply marked failed.
+        failed item does not terminate unrelated processing.  The optional
+        fallback runs first; exactly one record then states the actual outcome
+        (``degraded`` only when the fallback produced a result, ``failed`` when
+        neither the work nor the fallback completed).
 
         Example: ``controller.guard_work("stage verify", run_stage)`` keeps the
         remaining stages alive when one stage raises unexpectedly.
@@ -1494,34 +1894,32 @@ class RecoveryController:
         except ThresholdExceeded:
             raise
         except Exception as exc:  # noqa: BLE001 - the boundary owns the category
-            self.emit(
-                Diagnostic(
-                    tier,
-                    code,
-                    operation,
-                    "Unexpected %s: %s" % (type(exc).__name__, redact_text(str(exc))),
-                ),
-                recovery_action=recovery_action,
-                outcome="degraded" if fallback is not None else "failed",
-                fallback=fallback_description,
-                affected_outputs=affected_outputs,
-                omissions=omissions,
-                validation=validation,
-                remaining_uncertainty=remaining_uncertainty,
-                human_review=True,
-                output_effects=(
-                    "the affected work item is incomplete; independent work continues"
-                    if fallback is None
-                    else "a fallback result replaced the failed item; the affected work "
-                    "and any listed omissions must be reviewed"
-                ),
-                failure="%s: %s" % (type(exc).__name__, redact_text(str(exc))),
-            )
             if fallback is None:
+                self.emit(
+                    Diagnostic(
+                        tier,
+                        code,
+                        operation,
+                        "Unexpected %s: %s"
+                        % (type(exc).__name__, redact_text(str(exc))),
+                    ),
+                    recovery_action=recovery_action,
+                    outcome="failed",
+                    fallback="",
+                    affected_outputs=affected_outputs,
+                    omissions=omissions,
+                    validation=validation,
+                    remaining_uncertainty=remaining_uncertainty,
+                    human_review=True,
+                    output_effects=(
+                        "the affected work item is incomplete; independent work "
+                        "continues"
+                    ),
+                    failure="%s: %s" % (type(exc).__name__, redact_text(str(exc))),
+                )
                 return RecoveryResult(False, None, True, exc, 1, self.records[-1])
             try:
                 value = fallback(exc)
-                return RecoveryResult(True, value, True, exc, 1, self.records[-1])
             except ThresholdExceeded:
                 raise
             except Exception as fallback_exc:  # noqa: BLE001
@@ -1538,12 +1936,39 @@ class RecoveryController:
                     fallback=fallback_description,
                     affected_outputs=affected_outputs,
                     omissions=omissions,
+                    validation=validation,
+                    remaining_uncertainty=remaining_uncertainty,
                     human_review=True,
-                    output_effects="neither the requested work nor its fallback completed; "
-                    "the output is incomplete",
+                    output_effects="neither the requested work nor its fallback "
+                    "completed; the output is incomplete",
                     failure=redact_text(str(fallback_exc)),
                 )
-                return RecoveryResult(False, None, True, fallback_exc, 1, self.records[-1])
+                return RecoveryResult(
+                    False, None, True, fallback_exc, 1, self.records[-1]
+                )
+            # The fallback succeeded before this record was written, so
+            # ``degraded`` states what actually reached the output.
+            record = self.emit(
+                Diagnostic(
+                    tier,
+                    code,
+                    operation,
+                    "Unexpected %s: %s"
+                    % (type(exc).__name__, redact_text(str(exc))),
+                ),
+                recovery_action=recovery_action,
+                outcome="degraded",
+                fallback=fallback_description,
+                affected_outputs=affected_outputs,
+                omissions=omissions,
+                validation=validation,
+                remaining_uncertainty=remaining_uncertainty,
+                human_review=True,
+                output_effects="a fallback result replaced the failed item; the "
+                "affected work and any listed omissions must be reviewed",
+                failure="%s: %s" % (type(exc).__name__, redact_text(str(exc))),
+            )
+            return RecoveryResult(True, value, True, exc, 1, record)
 
     def flush_audit(self) -> List[Dict[str, Any]]:
         """Flush pending journal records and report audit failures once.
@@ -1596,11 +2021,18 @@ class RecoveryController:
             "fail_tier_rank": self.policy.fail_tier,
         }
 
-    def _log(self, record: RecoveryRecord) -> None:
+    def _log_text(self, line: str) -> None:
         try:
-            self.logger(record.to_dict()["formatted"])
+            self.logger(line)
         except Exception:  # a logger must never break the diagnostic path
             pass
+
+    def _log(self, record: RecoveryRecord) -> None:
+        try:
+            line = record.to_dict()["formatted"]
+        except Exception:  # a malformed record must not break logging
+            return
+        self._log_text(line)
 
 
 # ---------------------------------------------------------------------------
@@ -1696,8 +2128,12 @@ def render_run_markdown(
     """
     items = [_coerce_record(item) for item in (records or ())]
     items = [item for item in items if item is not None]
+    # The run id is caller/CLI supplied; collapse line breaks and render it as
+    # a code span whose fence is longer than any backtick run in the value, so
+    # it cannot forge a heading or an inline link.
+    safe_run_id = _one_line(run_id)
     lines = [
-        "## Run `%s`" % run_id,
+        "## Run %s" % _inline_code(safe_run_id),
         "",
         "Status: **%s**" % _one_line(status),
         "",
@@ -1746,7 +2182,14 @@ def _coerce_record(item: Any) -> Optional[RecoveryRecord]:
         payload = dict(item)
         payload.pop("formatted", None)
         fields = {field.name for field in dataclasses.fields(RecoveryRecord)}
-        return RecoveryRecord(**{key: value for key, value in payload.items() if key in fields})
+        try:
+            return RecoveryRecord(
+                **{key: value for key, value in payload.items() if key in fields}
+            )
+        except (TypeError, ValueError):
+            # A hand-edited/older journal entry may be missing required fields;
+            # one malformed record must not abort every other record's section.
+            return None
     return None
 
 

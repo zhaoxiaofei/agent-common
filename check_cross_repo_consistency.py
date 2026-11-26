@@ -13,6 +13,7 @@ first by ``check_model_catalog.py`` and ``check_shared_package.py``.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -202,12 +203,17 @@ def interpreter(repo: Path) -> str:
 def probe(label: str, repo: Path, code: str) -> Optional[Dict[str, Any]]:
     """The probe's parsed output, or ``None`` after reporting the failure."""
     try:
+        child_env = dict(os.environ)
+        # A read-only consistency check must not create ``__pycache__`` in the
+        # pinned submodule checkouts.
+        child_env["PYTHONDONTWRITEBYTECODE"] = "1"
         result = subprocess.run(
-            [interpreter(repo), "-c", code],
+            [interpreter(repo), "-B", "-c", code],
             cwd=str(repo),
             capture_output=True,
             text=False,
             timeout=120,
+            env=child_env,
         )
     except subprocess.TimeoutExpired:
         print("FAIL %s probe timed out" % label)
@@ -299,11 +305,14 @@ def main() -> int:
         print("FAIL %s" % error)
         return 1
     try:
+        child_env = dict(os.environ)
+        child_env["PYTHONDONTWRITEBYTECODE"] = "1"
         checks = subprocess.run(
-            [sys.executable, str(COMMON / "check_model_catalog.py")],
+            [sys.executable, "-B", str(COMMON / "check_model_catalog.py")],
             capture_output=True,
             text=True,
             timeout=120,
+            env=child_env,
         )
     except subprocess.TimeoutExpired:
         print("FAIL check_model_catalog.py timed out")

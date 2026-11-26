@@ -17,6 +17,7 @@ agent_common/                 the import package (underscores)
   chat.py                     chat token budgeting/response validation
                               (paper-refine + paper-refine-eval)
   agent_cli.py                dsh argv construction (GDP + paper-refine)
+  recovery.py                 severity tiers, recovery records/journal and fail-tier policy
 check_*.py                    cross-repo consistency checks
 test_llm_retry.py             retry-policy tests
 ```
@@ -130,11 +131,15 @@ an error, never a silent fallback.
 output cap, the single-shot chat cap, the default reasoning level, the base
 URLs and the model ids are defined in this repository, and a consumer reads
 them through `model_fact()`, the exported `QWEN_*`/`DOTS_*`/`DEEPSEEK_*`
-constants or `AGENT_MODELS` — never through its own copy.  Changing a value
-here is therefore a one-repository change: the gdp runtime, the paper-refine
-adapters and paper-refine-eval pick it up when their pinned submodule is
-advanced.  A literal that duplicates one of these values in a checkout is a
-bug; report it so it can be moved here.
+constants, `AGENT_MODELS` or the catalog — never through its own copy.
+The native DeepSeek Claude/Codex routes additionally pin
+`https://api.deepseek.com` and the `deepseek-flash[1m]`/`deepseek-flash`
+Claude ids in `agent_common/model_runtime.py`; those literals live in this
+repository, but they are not catalog fields, so a catalog edit alone does not
+move them.  Changing a value here is therefore a one-repository change: the gdp
+runtime, the paper-refine adapters and paper-refine-eval pick it up when their
+pinned submodule is advanced.  A literal that duplicates one of these values in
+a checkout is a bug; report it so it can be moved here.
 
 ## Verification
 
@@ -162,3 +167,7 @@ policy — was modified locally.
   paper-refine-eval's `pr_eval.llm` both use it.
 * `agent_cli.py` — `build_dsh_argv` for a one-shot headless run.  GDP's runner
   and the paper-refine adapters both use it.
+* `recovery.py` — the shared severity taxonomy, `Diagnostic`/`RecoveryRecord`
+  shape, the incremental JSONL journal with its documented fallback, the
+  `MarkdownReport` commit/run renderer, and the strict `--fail-tier` policy.
+  Both consumer repositories use it as the single diagnostic contract.

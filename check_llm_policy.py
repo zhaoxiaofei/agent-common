@@ -43,30 +43,89 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _model_runtime_aliases(tree: ast.AST) -> set:
-    """Every local name that imports the shared ``model_runtime`` module."""
-    aliases = set()
+class _ModelRuntimeAliases(set):
+    """Module aliases (set-like, for backward compatibility) plus symbols."""
+
+    def __init__(self, modules=(), symbols=()):
+        super().__init__(modules)
+        # Local imported name -> original symbol, so an aliased from-import can
+        # still be resolved back to the attribute it provides.
+        self.symbols = dict(symbols)
+
+
+def _model_runtime_aliases(tree: ast.AST) -> _ModelRuntimeAliases:
+    """Module aliases and directly imported symbols for ``model_runtime``.
+
+    Handles ``import model_runtime``, ``import pkg.model_runtime [as m]``,
+    ``from pkg import model_runtime``, and
+    ``from pkg.model_runtime import RETRY_SCHEDULE, dsh_patch_text`` including
+    aliased imports (the local name maps to the original symbol).
+    """
+    modules = set()
+    symbols = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name == "model_runtime" or alias.name.endswith(
                     ".model_runtime"
                 ):
-                    aliases.add(alias.asname or alias.name.split(".")[-1])
+                    modules.add(alias.asname or alias.name.split(".")[0])
+                    modules.add(alias.name)
         elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
             for alias in node.names:
                 if alias.name == "model_runtime":
-                    aliases.add(alias.asname or alias.name)
-    return aliases
+                    # ``from pkg import model_runtime``
+                    modules.add(alias.asname or alias.name)
+                elif module == "model_runtime" or module.endswith(
+                    ".model_runtime"
+                ):
+                    # ``from pkg.model_runtime import SYMBOL [as LOCAL]``
+                    symbols[alias.asname or alias.name] = alias.name
+    return _ModelRuntimeAliases(modules, symbols)
+
+
+def _dotted_name(node: ast.AST) -> str:
+    """The dotted spelling of a Name/Attribute chain, or ``""``."""
+    parts = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return ""
+    parts.append(current.id)
+    return ".".join(reversed(parts))
+
+
+def _uses_symbol(tree: ast.AST, name: str) -> bool:
+    """Whether ``name`` is loaded somewhere outside an import statement."""
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Name)
+            and node.id == name
+            and isinstance(node.ctx, ast.Load)
+        ):
+            return True
+    return False
 
 
 def _uses_attribute(tree: ast.AST, aliases: set, attribute: str) -> bool:
+    symbols = getattr(aliases, "symbols", {})
+    for local, original in symbols.items():
+        if original == attribute and _uses_symbol(tree, local):
+            return True
     for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Attribute)
-            and node.attr == attribute
-            and isinstance(node.value, ast.Name)
-            and node.value.id in aliases
+        if not (isinstance(node, ast.Attribute) and node.attr == attribute):
+            continue
+        dotted = _dotted_name(node.value)
+        if not dotted:
+            continue
+        if any(
+            dotted == module
+            or dotted.endswith("." + module)
+            or module.endswith("." + dotted)
+            for module in aliases
         ):
             return True
     return False
@@ -244,7 +303,7 @@ def main() -> int:
             problems.append("cannot parse adapter %s: %s" % (adapter, exc))
             continue
         aliases = _model_runtime_aliases(tree)
-        if not aliases:
+        if not aliases and not aliases.symbols:
             problems.append("%s does not import the shared model runtime" % adapter)
             continue
         # Parse the wiring instead of searching for one exact spelling: a

@@ -181,13 +181,19 @@ result = controller.run_with_recovery(
     fallback=default_input,
     omissions=["the requested input was replaced by the documented default"],
 )
-journal.finalize("completed" if result.ok else "blocked")
+# A successful fallback still has degraded=True; do not report it as complete.
+status = "completed" if result.ok and not result.degraded else "partial"
+journal.finalize(status)
 ```
 
 `rank > threshold` raises `ThresholdExceeded` only after the diagnostic and its
-recovery record are persisted.  At or below the threshold the recovery result
-is returned and processing continues.  `CRITICAL` is the default threshold, so
-nothing exceeds it and the default is always-continue.
+recovery record were recorded: persisted when a journal is configured and
+writable, otherwise retained in memory/pending and reported as an
+`AUDIT_WRITE_FAILED` warning (the configured threshold stop is still enforced).
+With no journal configured, the record is logged but not persisted.  At or
+below the threshold the recovery result is returned and processing continues.
+`CRITICAL` is the default threshold, so nothing exceeds it and the default is
+always-continue.
 
 Key entry points:
 

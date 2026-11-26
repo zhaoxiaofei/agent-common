@@ -26,6 +26,7 @@ import http.server
 import json
 import math
 import os
+import re
 import threading
 import urllib.error
 import urllib.parse
@@ -527,10 +528,13 @@ _CREDENTIAL_KEY_NAMES = frozenset(
         "clientsecret",
         "clientsecrets",
         "password",
+        "passwords",
         "passwd",
+        "passwds",
         "credential",
         "credentials",
         "authorization",
+        "authorizations",
         "auth",
         "bearer",
         "accesskey",
@@ -667,6 +671,14 @@ def _apply_model_catalog(models: Dict[str, Dict[str, Any]]) -> None:
     try:
         with _MODEL_CATALOG_PATH.open(encoding="utf-8") as handle:
             document = json.load(handle)
+        if not isinstance(document, dict):
+            # ``document.get`` on a list/string/null raised a raw AttributeError,
+            # which is not in the malformed-catalog tuple below and escaped the
+            # documented ConfigError contract.
+            raise ConfigError(
+                "the shared model catalog %s must be a JSON object, not %s"
+                % (_MODEL_CATALOG_PATH, type(document).__name__)
+            )
         # The checker rejects an unsupported schema_version, but the runtime
         # used to ignore it: a future document could load with silently
         # different semantics while check_model_catalog passed on another
@@ -1659,6 +1671,44 @@ class AgentSelection:
         # as a URL must not smuggle userinfo/query credentials into the record.
         record_model_name = _redacted_endpoint_text(self.model_name)
         record_id = _redacted_endpoint_text(self.effective_model_id(raw_model))
+        endpoint_value = (
+            str(record_model)
+            if self.is_endpoint and record_model is not None
+            else None
+        )
+        model_name_value = record_model_name if self.is_endpoint else None
+        # A raw endpoint URL on a *named* selection is the endpoint route (the
+        # patch/env builders resolve it that way), so the record must not claim
+        # a named GPT model with an endpoint id and no endpoint.  The
+        # sentinel/legacy shape keeps its historical raw-URL id.
+        if (
+            raw_model
+            and agent_model_is_endpoint(str(raw_model))
+            and self.model is not None
+            and not self.is_default
+            and not self.is_endpoint
+        ):
+            effective = AgentSelection(
+                harness=self.harness,
+                model=str(raw_model),
+                legacy=self.legacy,
+                api_key=self.api_key,
+                model_name=self.model_name,
+                prep_json=self.prep_json,
+            )
+            record_model = _redacted_endpoint_text(effective.model)
+            record_model_name = _redacted_endpoint_text(effective.model_name)
+            record_id = _redacted_endpoint_text(
+                effective.effective_model_id()
+            ) or "default"
+            endpoint_value = (
+                str(record_model)
+                if effective.is_endpoint and record_model is not None
+                else None
+            )
+            model_name_value = (
+                record_model_name if effective.is_endpoint else None
+            )
         # Report the credential the live request will actually use: an
         # explicit key, the endpoint's key environment (default or the
         # caller-named one), or a URL userinfo/query secret.  Checking only
@@ -1705,10 +1755,8 @@ class AgentSelection:
             # written to command.json and status.json, which every agent can read, so the
             # persisted endpoint keeps only the scheme/host/path. The live AgentSelection
             # still carries the raw URL for the actual request.
-            "endpoint": str(record_model)
-            if self.is_endpoint and record_model is not None
-            else None,
-            "model_name": record_model_name if self.is_endpoint else None,
+            "endpoint": endpoint_value,
+            "model_name": model_name_value,
             "api_key_set": api_key_set,
             "prep_keys": sorted(str(key) for key in self.prep_json),
         }
@@ -1949,10 +1997,16 @@ def endpoint_query_model(url: str) -> str:
         does not raise for a bad URL.
     """
     try:
-        values = urllib.parse.parse_qs(urllib.parse.urlsplit(str(url)).query)
+        query = urllib.parse.urlsplit(str(url)).query
     except ValueError:
         return ""
-    return str((values.get("model") or [""])[0]).strip()
+    # Every other endpoint parser treats ``;`` as a query separator; using
+    # ``parse_qs`` here kept ``model=x;api_key=SECRET`` as one value and
+    # exported the credential as the model id.
+    for key, value in _query_pairs(query):
+        if key == "model":
+            return str(value).strip()
+    return ""
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -2078,32 +2132,61 @@ def _endpoint_context(entries: Sequence[Mapping[str, Any]], model: str) -> Optio
 
 
 def _endpoint_request_key(
-    selection: AgentSelection, api_key: Optional[str] = None
+    selection: AgentSelection,
+    api_key: Optional[str] = None,
+    *,
+    endpoint_api_key_env: Optional[str] = None,
 ) -> str:
     """The credential the live endpoint request would send.
 
     Keep this in one place: the ``/models`` preflight must authenticate with
     exactly the key the request uses.  An explicit key wins, then the
-    selection's key, then the default key environment, then a credential
-    carried by the URL (accepted when ``REJECT_ENDPOINT_CREDENTIALS`` is off).
-    The URL secret was already extracted by ``_provider_family_settings`` for
-    the live route but was omitted from the preflight.
+    selection's key, then the default key environment (or the caller-named one
+    the generated patch declares), then a credential carried by the URL
+    (accepted when ``REJECT_ENDPOINT_CREDENTIALS`` is off).
     """
     if api_key:
         return str(api_key)
     if selection.api_key:
         return str(selection.api_key)
-    env_key = _env(AGENT_MODEL_API_KEY_ENV)
-    if env_key:
-        return env_key
+    env_names = [AGENT_MODEL_API_KEY_ENV]
+    if endpoint_api_key_env and endpoint_api_key_env not in env_names:
+        env_names.append(endpoint_api_key_env)
+    for name in env_names:
+        env_key = _env(name)
+        if env_key:
+            return env_key
     _safe_url, url_secret = split_endpoint_credentials(
         str(selection.model or "")
     )
     return url_secret
 
 
+_DIAGNOSTIC_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\u2028\u2029]+")
+_DIAGNOSTIC_CREDENTIAL_RE = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?key|secret|token|password|passwd|"
+    r"authorization|signature|sig)\s*[:=]\s*[^\s,;]+"
+)
+
+
+def _diagnostic_model_id(value: Any, limit: int = 120) -> str:
+    """One safe line for an endpoint-supplied model id in an error message."""
+    text = _redacted_endpoint_text(str(value)) or ""
+    text = _DIAGNOSTIC_CONTROL_RE.sub(" ", text).strip()
+    text = _DIAGNOSTIC_CREDENTIAL_RE.sub(
+        lambda match: "%s=<redacted>" % match.group(1), text
+    )
+    if len(text) > limit:
+        text = text[: limit - 3].rstrip() + "..."
+    return text
+
+
 def resolve_endpoint_model(
-    selection: AgentSelection, *, probe: bool = True, api_key: Optional[str] = None
+    selection: AgentSelection,
+    *,
+    probe: bool = True,
+    api_key: Optional[str] = None,
+    endpoint_api_key_env: Optional[str] = None,
 ) -> Tuple[str, Optional[int], str]:
     """``(model_name, context_window, error)`` for a custom endpoint.
 
@@ -2126,7 +2209,9 @@ def resolve_endpoint_model(
     if selection.model_name:
         if not probe:
             return selection.model_name, None, ""
-        key = _endpoint_request_key(selection, api_key)
+        key = _endpoint_request_key(
+        selection, api_key, endpoint_api_key_env=endpoint_api_key_env
+    )
         try:
             entries = _endpoint_catalog(
                 endpoint_base(str(selection.model or "")), key
@@ -2141,7 +2226,9 @@ def resolve_endpoint_model(
         return query_model, None, ""
     if not probe:
         return "default", None, ""
-    key = _endpoint_request_key(selection, api_key)
+    key = _endpoint_request_key(
+        selection, api_key, endpoint_api_key_env=endpoint_api_key_env
+    )
     try:
         entries = _endpoint_catalog(endpoint_base(str(selection.model or "")), key)
     except _EndpointProbeError as exc:
@@ -2157,7 +2244,7 @@ def resolve_endpoint_model(
             "the endpoint lists %d models (%s%s); pass --agent-model-name to "
             "choose one" % (
                 len(models),
-                ", ".join(models[:8]),
+                ", ".join(_diagnostic_model_id(model) for model in models[:8]),
                 "..." if len(models) > 8 else "",
             )
         )
@@ -2348,11 +2435,26 @@ _PREP_OPENER = urllib.request.build_opener(
 
 
 def _reject_dot_segments(path: str) -> None:
-    """Reject ``.``/``..`` path segments before they escape the proxy prefix."""
-    decoded = urllib.parse.unquote(str(path or ""))
+    """Reject ``.``/``..`` path segments before they escape the proxy prefix.
+
+    A single ``unquote`` let a double-encoded ``%252e%252e`` through; the
+    upstream may decode it once more and resolve ``..`` outside the prefix.
+    Decode repeatedly until stable, then refuse any residual encoded dot,
+    slash or backslash.
+    """
+    decoded = str(path or "")
+    for _attempt in range(8):
+        candidate = urllib.parse.unquote(decoded)
+        if candidate == decoded:
+            break
+        decoded = candidate
     if any(segment in (".", "..") for segment in decoded.split("/")):
         raise ValueError(
             "request target must not contain '.' or '..' path segments"
+        )
+    if re.search(r"(?i)%2e|%2f|%5c", decoded):
+        raise ValueError(
+            "request target must not contain encoded '.' or path separators"
         )
 
 
@@ -3078,6 +3180,7 @@ def selection_problem(
     *,
     dry_run: bool = False,
     raw_model: Optional[str] = None,
+    endpoint_api_key_env: Optional[str] = None,
 ) -> str:
     """A configuration problem that would fail the first real request ('' = none).
 
@@ -3108,7 +3211,9 @@ def selection_problem(
         # Run the same endpoint resolution the live request uses, so an
         # ambiguous listing (or a failed /models probe) is reported here
         # instead of surfacing as a plausible but wrong ``default`` model.
-        _model_name, _context_window, error = resolve_endpoint_model(effective)
+        _model_name, _context_window, error = resolve_endpoint_model(
+            effective, endpoint_api_key_env=endpoint_api_key_env
+        )
         return error
     # Validate the same route capacities/base URL the generated patch enforces;
     # selection_problem used to return "" for a value dsh_patch_text rejected.
@@ -3191,8 +3296,17 @@ def _resolve_token_capacities(
 
 
 def _normalized_patch_base_url(value: Any) -> str:
-    """A credential-free, chat-completions-normalized provider base URL."""
-    return endpoint_base(str(value or ""))
+    """A credential-free, chat-completions-normalized provider base URL.
+
+    A gateway may require a non-secret query parameter (``api-version=2024``);
+    ``endpoint_base`` drops the whole query for artifact safety, so the
+    non-secret part is re-attached here.  Every generated route uses this
+    helper, so qwen/dots/endpoint/override URLs behave the same way.
+    """
+    text = str(value or "")
+    safe = endpoint_base(text)
+    query = _non_secret_query(text)
+    return safe + ("?" + query if query else "")
 
 
 def _non_secret_query(url: Any) -> str:
@@ -3207,6 +3321,15 @@ def _non_secret_query(url: Any) -> str:
         if not _secret_query_key(key)
     ]
     return urllib.parse.urlencode(kept, doseq=True) if kept else ""
+
+
+def _is_loopback_url(value: Any) -> bool:
+    """Whether ``value`` names a loopback host (the retry-proxy shape)."""
+    try:
+        host = urllib.parse.urlsplit(str(value or "")).hostname
+    except ValueError:
+        return False
+    return host in ("127.0.0.1", "localhost", "::1")
 
 
 def _normalized_route_base_url(value: Any) -> str:
@@ -3228,7 +3351,7 @@ def _normalized_route_base_url(value: Any) -> str:
         # an invalid endpoint.
         return ""
     try:
-        return endpoint_base(text)
+        normalized = endpoint_base(text)
     except ConfigError:
         try:
             parsed = urllib.parse.urlsplit(text)
@@ -3239,7 +3362,14 @@ def _normalized_route_base_url(value: Any) -> str:
             raise
         if parsed.scheme not in ("http", "https"):
             raise
-        return text.rstrip("/")
+        # Drop the query here: the shared tail below re-attaches the
+        # non-secret query exactly once (the old text.rstrip("/") kept it and
+        # the tail appended it a second time).
+        normalized = urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, "", "")
+        ).rstrip("/")
+    query = _non_secret_query(text)
+    return normalized + ("?" + query if query else "")
 
 
 def dsh_patch_text(
@@ -3254,6 +3384,7 @@ def dsh_patch_text(
     effort_override: Optional[str] = None,
     compaction_base_url: Optional[str] = None,
     endpoint_api_key_env: Optional[str] = None,
+    compaction_is_proxy: Optional[bool] = None,
 ) -> str:
     """The ``dsh --patch`` overlay that selects or configures the provider.
 
@@ -3338,7 +3469,7 @@ def dsh_patch_text(
             # artifact safety, and the prep proxy is only started when a prep
             # object exists.  Keep the non-secret part in the generated base.
             query = _non_secret_query(selection.model)
-            if query:
+            if query and "?" not in base_url:
                 base_url += "?" + query
         context_window, max_tokens = _resolve_token_capacities(
             settings,
@@ -3499,6 +3630,13 @@ def dsh_patch_text(
             if compaction_base_url
             else None
         )
+        # A direct compaction URL keeps the retry ladder; only the loopback
+        # retry proxy owns the retries.  The caller may state that explicitly.
+        proxy_in_path = (
+            compaction_is_proxy
+            if compaction_is_proxy is not None
+            else _is_loopback_url(compaction_base)
+        )
         context_window, max_tokens = _resolve_token_capacities(
             settings,
             context_window_override,
@@ -3515,8 +3653,9 @@ def dsh_patch_text(
             max_tokens=max_tokens,
             regular_api_key_env=settings["api_key_env"],
             compaction_base_url=compaction_base,
-            # The proxy owns the retries only when the caller started one.
-            compaction_is_proxy=bool(compaction_base),
+            # The proxy owns the retries only when the caller started one; a
+            # direct compaction URL keeps its own retryPolicy.
+            compaction_is_proxy=bool(proxy_in_path),
             reasoning_effort=str(
                 effort_override or settings["effort"] or DOTS_DEFAULT_EFFORT
             ),
@@ -3632,10 +3771,11 @@ def codex_provider_args(
         selection = inferred
     settings = _provider_family_settings(selection)
     family = settings["family"]
-    if family == "claude" and raw_model:
-        # Codex has no Claude builder.  Silently returning [] meant the
-        # operator's raw model never reached the child and no record showed the
-        # mismatch; make the unsupported pair explicit.
+    if family == "claude":
+        # Codex has no Claude builder.  Returning [] meant the operator's
+        # selection never reached the child and no record showed the mismatch;
+        # a directly constructed Claude selection has no raw_model either, so
+        # the guard must not depend on it.
         raise ConfigError("a Claude model cannot run on gpt-codex; use claude-code")
     # The argv is world-readable, so a credential-bearing URL must never be
     # emitted verbatim; the DSH route already redacts the same raw_model.
@@ -3852,8 +3992,13 @@ def claude_environment(
     if family == "endpoint":
         return {}
     root = _normalized_route_base_url(settings["base_url"])
-    if root.endswith("/v1"):
-        root = root[:-3]
+    # Keep a non-secret query when trimming the Anthropic ``/v1`` suffix.
+    root_path, query_separator, root_query = root.partition("?")
+    if root_path.endswith("/v1"):
+        root_path = root_path[:-3]
+    root = root_path + (
+        query_separator + root_query if query_separator else ""
+    )
     # Dots and DeepSeek require a real key; only the local Qwen route may run
     # with the historical dummy value.  A missing key must not be turned into a
     # bogus bearer token that hides the documented selection_problem.
