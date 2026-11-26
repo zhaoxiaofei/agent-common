@@ -8,7 +8,7 @@ project directory is `agent-common` (hyphenated).
 import sys
 sys.path.insert(0, "/path/to/checkout/agent-common")
 
-from agent_common import chat, dsh_events, model_runtime, llm_retry, agent_cli
+from agent_common import chat, dsh_events, model_runtime, llm_retry, agent_cli, recovery
 ```
 
 Every public function and callable method has a docstring with at least one
@@ -149,3 +149,59 @@ The public names above are the supported surface.  Adding parameters is
 backward-compatible; removing/renaming a public name or changing a documented
 return shape is not.  Internal helpers (`_name`) and generated YAML text are
 not covered by that promise.
+
+## `recovery` — shared severity tiers, recovery records and `--fail-tier`
+
+Both consumer repositories use this module as the single source of truth for
+application diagnostics.  A diagnostic has an ordered tier (`DEBUG` 0,
+`INFO` 1, `WARNING` 2, `ERROR` 3, `CRITICAL` 4), a stable code, an affected
+operation and a message, and renders as:
+
+```
+TIER-<NAME>-<CODE>: <message>
+```
+
+Severity describes impact, never recoverability: every tier has a recovery
+routine.  The failure policy compares the diagnostic rank strictly against the
+configured `--fail-tier`:
+
+```python
+from agent_common import recovery as r
+
+tier = r.parse_fail_tier("error")          # 3; names are case-insensitive
+policy = r.FailurePolicy(r.parse_fail_tier(None))  # default CRITICAL (always continue)
+journal = r.RecoveryJournal("<run>/recovery", "<run-id>")
+journal.start({"command": "find-bugs"})
+controller = r.RecoveryController(run_id="<run-id>", policy=policy, journal=journal)
+result = controller.run_with_recovery(
+    r.Diagnostic(r.TIER_ERROR, "INPUT_UNREADABLE", "find-bugs", "Could not read input."),
+    "retry with the lenient decoder",
+    read_input,
+    max_attempts=2,
+    fallback=default_input,
+    omissions=["the requested input was replaced by the documented default"],
+)
+journal.finalize("completed" if result.ok else "blocked")
+```
+
+`rank > threshold` raises `ThresholdExceeded` only after the diagnostic and its
+recovery record are persisted.  At or below the threshold the recovery result
+is returned and processing continues.  `CRITICAL` is the default threshold, so
+nothing exceeds it and the default is always-continue.
+
+Key entry points:
+
+| Function / class | Purpose |
+| --- | --- |
+| `parse_fail_tier` / `fail_tier_help` | Validate names/ranks 0-4; no silent substitution. |
+| `Diagnostic` / `format_diagnostic` | Tier + stable code + operation + message. |
+| `RecoveryRecord` | Audit shape: run/event ids, timestamp, attempt, outcome, omissions, affected outputs, validation, uncertainty and review need. |
+| `RecoveryJournal` | Incremental JSONL journal, `in_progress`/finalized `run.json`, documented fallback, pending records. |
+| `RecoveryController` | Emit, strict threshold evaluation, bounded retries, fallback, work-boundary guard. |
+| `MarkdownReport` | Sectioned report that preserves earlier runs. |
+| `render_commit_section` / `render_run_markdown` | Repository-specific audit destinations. |
+
+Counterexample: do not treat a `recovered` outcome as proof that every check
+ran; skipped checks are recorded as `CHECKS_SKIPPED` with their own omissions.
+Do not catch `ThresholdExceeded` and continue — it is the operator-selected
+stop, and only cleanup belongs in its handler.
