@@ -894,6 +894,12 @@ def _reject_dot_segments(path: str) -> None:
         if candidate == decoded:
             break
         decoded = candidate
+    if "\\" in decoded:
+        # ``%5c`` decodes to a literal backslash here, which the residual
+        # ``%5c`` check below can no longer see.  A backslash-normalizing
+        # upstream would read ``..\admin`` as traversal, so refuse any
+        # backslash in the forwarded path.
+        raise ValueError("request target must not contain a backslash")
     if any(segment in (".", "..") for segment in decoded.split("/")):
         raise ValueError(
             "request target must not contain '.' or '..' path segments"

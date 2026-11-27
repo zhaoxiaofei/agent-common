@@ -357,13 +357,18 @@ def _query_pairs(query: str) -> list:
 
 def _carries_unparsed_credential(text: str) -> bool:
     """Detect userinfo/credential query textually when ``urlsplit`` fails."""
-    without_fragment = str(text or "").split("#", 1)[0]
+    value = str(text or "")
+    without_fragment, _separator, fragment = value.partition("#")
     _before_query, _, query = without_fragment.partition("?")
     if "@" in _textual_authority(without_fragment):
         return True
-    if query:
-        if any(
-            _credential_key(key) for key, _value in _query_pairs(query)
+    # A fragment is not sent by the generated patch, but it is still part of
+    # the persisted record/repr value.  ``foo#api_key=SECRET`` parsed as a
+    # scheme-less path and the old predicate dropped the fragment before
+    # scanning it, so the secret reached to_record() and dsh_patch_text().
+    for candidate in (query, fragment):
+        if candidate and any(
+            _credential_key(key) for key, _value in _query_pairs(candidate)
         ):
             return True
     return False
@@ -2084,10 +2089,14 @@ def _endpoint_catalog(base_url: str, api_key: str = "", timeout: float = 5.0) ->
         OSError,
         ValueError,
         TypeError,
+        RecursionError,
         http.client.HTTPException,
     ) as exc:
         # BadStatusLine/IncompleteRead are HTTPException, not OSError.  A
         # malformed upstream response is a probe failure, not an empty listing.
+        # A body within the byte bound can still be deeply nested enough that
+        # ``json.loads`` raises RecursionError; it is remote input, not a
+        # programming error, so it belongs to the probe-failure contract.
         raise _EndpointProbeError(
             "the endpoint /models listing failed: %s" % exc
         ) from None
@@ -2448,6 +2457,12 @@ def _reject_dot_segments(path: str) -> None:
         if candidate == decoded:
             break
         decoded = candidate
+    if "\\" in decoded:
+        # ``%5c`` decodes to a literal backslash here, which the residual
+        # ``%5c`` check below can no longer see.  A backslash-normalizing
+        # upstream would read ``..\admin`` as traversal, so refuse any
+        # backslash in the forwarded path.
+        raise ValueError("request target must not contain a backslash")
     if any(segment in (".", "..") for segment in decoded.split("/")):
         raise ValueError(
             "request target must not contain '.' or '..' path segments"
@@ -2691,10 +2706,24 @@ class _PrepProxyHandler(http.server.BaseHTTPRequestHandler):
         if prep and body:
             try:
                 payload = json.loads(body)
+            except RecursionError:
+                # Deeply nested remote input is a bad request, not a handler
+                # crash.  The old code caught only ValueError, so the thread
+                # died and the client saw RemoteDisconnected.
+                self._send_error(400, "request body is nested too deeply")
+                return
             except ValueError:
                 payload = None
             if isinstance(payload, dict):
-                deep_merge(payload, prep)
+                try:
+                    deep_merge(payload, prep)
+                except ConfigError as exc:
+                    # The prep object is caller-validated at startup, but a
+                    # valid deep request body plus a valid deep prep can still
+                    # exceed the merge bound.  Answer with the same structured
+                    # 400 the other validation paths use.
+                    self._send_error(400, str(exc))
+                    return
                 try:
                     body = json.dumps(payload, allow_nan=False).encode("utf-8")
                 except (TypeError, ValueError) as exc:
@@ -2764,9 +2793,10 @@ def start_prep_proxy(target_base: str, prep: Mapping[str, Any]) -> Tuple[str, st
     try:
         prep_object = dict(prep)
         # Fail at startup, not inside the first request's handler thread.
-        # allow_nan=False rejects a directly supplied NaN/Infinity too.
+        # allow_nan=False rejects a directly supplied NaN/Infinity too, and
+        # RecursionError covers a prep object too deep to encode.
         json.dumps(prep_object, allow_nan=False)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         return "", "prep object is not JSON-serialisable: %s" % exc
     try:
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _PrepProxyHandler)
@@ -2918,7 +2948,11 @@ def _env_base_url(name: str, default: str) -> Tuple[str, str]:
 def _normalized_family(selection: AgentSelection) -> str:
     if selection.is_endpoint:
         return "endpoint"
-    return str((AGENT_MODELS.get(selection.model or "") or {}).get("family") or "")
+    # ``model_info`` and ``resolve_agent_selection`` normalize an alias before
+    # reading the table; a directly constructed public dataclass must resolve
+    # the same way or it silently loses its provider route.
+    key = normalize_agent_model(selection.model or "")
+    return str((AGENT_MODELS.get(key) or {}).get("family") or "")
 
 
 def _effective_selection(
@@ -3344,6 +3378,10 @@ def _normalized_route_base_url(value: Any) -> str:
     behind by scrubbing ``user:pw@host/v1``) is not a usable endpoint either;
     exporting it made every child request fail, so it raises the same
     ``ConfigError`` as :func:`endpoint_base` instead of returning a bare host.
+    The same applies to an out-of-range port and to an unparsable URL: the
+    Codex/Claude child must not export a base URL that the DSH route and
+    ``selection_problem`` already reject, and the error text must stay
+    credential-free.
     """
     text = str(value or "")
     if not text:
@@ -3352,16 +3390,25 @@ def _normalized_route_base_url(value: Any) -> str:
         return ""
     try:
         normalized = endpoint_base(text)
-    except ConfigError:
+    except ConfigError as exc:
         try:
             parsed = urllib.parse.urlsplit(text)
         except ValueError:
-            # Unparsable legacy forms (already credential-free) stay tolerated.
-            return text.rstrip("/")
-        if not parsed.netloc:
-            raise
-        if parsed.scheme not in ("http", "https"):
-            raise
+            # Never return the raw unparsable text: it may still carry
+            # userinfo (``https://user:pw@[bad/v1``).  ``_safe_endpoint_text``
+            # strips that before the error message.
+            raise ConfigError(
+                "--agent-model endpoint %r is not an http(s) URL with a host"
+                % _safe_endpoint_text(text)
+            ) from None
+        if not parsed.hostname or parsed.scheme not in ("http", "https"):
+            raise exc from None
+        try:
+            port = parsed.port
+        except ValueError:
+            raise exc from None
+        if port is not None and not 0 < port <= 65535:
+            raise exc from None
         # Drop the query here: the shared tail below re-attaches the
         # non-secret query exactly once (the old text.rstrip("/") kept it and
         # the tail appended it a second time).
@@ -3656,8 +3703,13 @@ def dsh_patch_text(
             # The proxy owns the retries only when the caller started one; a
             # direct compaction URL keeps its own retryPolicy.
             compaction_is_proxy=bool(proxy_in_path),
-            reasoning_effort=str(
-                effort_override or settings["effort"] or DOTS_DEFAULT_EFFORT
+            # The overlay keeps a direct-caller fallback for an unrecognised
+            # spelling, but an operator-supplied level must validate like
+            # every other family: README documents an unknown level as an
+            # error, never a silent fallback.
+            reasoning_effort=normalize_reasoning_effort(
+                "dots3-note-preview",
+                effort_override or settings["effort"] or DOTS_DEFAULT_EFFORT,
             ),
         )
     if family == "deepseek":

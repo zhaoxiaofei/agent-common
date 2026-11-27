@@ -444,16 +444,22 @@ class ModelRuntimeRegressionTests(unittest.TestCase):
             finally:
                 model_runtime._MODEL_CATALOG_PATH = original
 
-    def test_tolerated_route_base_keeps_one_non_secret_query(self):
+    def test_route_base_rejects_invalid_host_and_port(self):
+        # F06: exporting a base URL that endpoint_base (and the DSH route)
+        # already rejects made the Codex/Claude child fail only at the first
+        # request.  All three routes must reject it up front.
+        for invalid in (
+            "http://host:99999/v1?api-version=2024",
+            "http://:8080/v1?x=1",
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(model_runtime.ConfigError):
+                    model_runtime._normalized_route_base_url(invalid)
         self.assertEqual(
             model_runtime._normalized_route_base_url(
-                "http://host:99999/v1?api-version=2024"
+                "http://host/v1?api-version=2024"
             ),
-            "http://host:99999/v1?api-version=2024",
-        )
-        self.assertEqual(
-            model_runtime._normalized_route_base_url("http://:8080/v1?x=1"),
-            "http://:8080/v1?x=1",
+            "http://host/v1?api-version=2024",
         )
 
     def test_non_secret_query_survives_every_generated_route(self):

@@ -157,7 +157,19 @@ _ASSIGNMENT_VALUE_RE = re.compile(
     r"(?i)(?:(?:bearer|basic)\s+)?"
     r"(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s,;}{]+)"
 )
-_URL_RE = re.compile(r"(?i)\b(?:https?|ftp)://[^\s'\"<>]+")
+_URL_RE = re.compile(
+    r"(?i)(?:"
+    r"(?:[A-Za-z][A-Za-z0-9+.\-]*://"
+    r"|(?<![\w:/])//"
+    r"|(?<![\w:/])[A-Za-z][A-Za-z0-9+.\-]*:/)"
+    r"[^\s'\"<>]+"
+    # A bare-userinfo endpoint in free text (``user:pw@host/v1``) still
+    # carries a password.  It needs a path, so an e-mail address and a
+    # ``mailto:user@host`` value are not matched.
+    r"|(?<![\w:/@])[A-Za-z0-9._~%+\-]+:[^\s:@/]+@[A-Za-z0-9.\-]+"
+    r"(?::\d+)?/[^\s'\"<>]*"
+    r")"
+)
 _BEARER_RE = re.compile(
     r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]{6,})"
 )
@@ -172,34 +184,128 @@ def _query_pairs(query: str) -> List[Tuple[str, str]]:
         return []
 
 
+def _redact_query_component(component: str) -> str:
+    """Mask credential-named values in a query or fragment string."""
+    if not component:
+        return component
+    if not any(separator in component for separator in ("=", "&", ";")):
+        return component
+    pairs = _query_pairs(component)
+    if not pairs:
+        return component
+    return urllib.parse.urlencode(
+        [
+            (key, "<redacted>" if _credential_key(key) else value)
+            for key, value in pairs
+        ],
+        doseq=True,
+    )
+
+
+def _credential_query_or_fragment(text: str) -> bool:
+    """Whether a scheme-less value carries a credential-named query/fragment."""
+    query = text.partition("?")[2].partition("#")[0]
+    fragment = text.partition("#")[2]
+    return any(
+        "=" in component
+        and any(
+            _credential_key(key) for key, _value in _query_pairs(component)
+        )
+        for component in (query, fragment)
+    )
+
+
+def _looks_url_shaped(text: str) -> bool:
+    """Whether masking userinfo on ``text`` cannot mangle ordinary prose.
+
+    An e-mail address (``user@host``) has no path and stays untouched; a
+    scheme-relative, one-slash or bare-userinfo endpoint does not.
+    """
+    value = str(text)
+    if "://" in value or value.startswith("//"):
+        return True
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.\-]*:/", value):
+        return True
+    if "@" in value:
+        _userinfo, _separator, rest = value.rpartition("@")
+        # A bare-userinfo endpoint carries a path after the host; an e-mail
+        # address or a ``mailto:user@host`` value does not, so leave it alone.
+        if "/" in rest:
+            return True
+    # A scheme-less value with a credential in its query or fragment
+    # (``foo?api_key=SECRET``) is still a credential-bearing URL.
+    if _credential_query_or_fragment(value):
+        return True
+    return False
+
+
+def _redact_textual_userinfo(base: str) -> str:
+    """Mask the userinfo of an authority ``urlsplit`` could not represent."""
+    match = re.match(
+        r"^(?P<prefix>(?:[A-Za-z][A-Za-z0-9+.\-]*:)?/{0,2})(?P<rest>.*)$",
+        base,
+    )
+    if match is None:
+        return base
+    prefix, rest = match.group("prefix"), match.group("rest")
+    authority, separator, tail = rest.partition("/")
+    if "@" in authority:
+        userinfo, _at, host = authority.rpartition("@")
+        user, colon, _password = userinfo.partition(":")
+        authority = (
+            user + ":<redacted>@" + host
+            if colon
+            else "<redacted>@" + host
+        )
+    return prefix + authority + separator + tail
+
+
+def _redact_url_textually(raw: str) -> str:
+    """Scrub a URL ``urlsplit`` did not expose as scheme + authority.
+
+    Covers scheme-relative (``//user:pw@host/v1``), one-slash
+    (``http:/user:pw@host/v1``) and bare-userinfo (``user:pw@host/v1``) forms.
+    """
+    head, fragment_separator, fragment = raw.partition("#")
+    base, query_separator, query = head.partition("?")
+    query = _redact_query_component(query)
+    fragment = _redact_query_component(fragment)
+    base = _redact_textual_userinfo(base)
+    return (
+        base
+        + (query_separator + query if query_separator else "")
+        + (fragment_separator + fragment if fragment_separator else "")
+    )
+
+
 def _redact_url(text: str) -> str:
-    """Mask URL userinfo and credential-named query values in one string."""
+    """Mask URL userinfo and credential-named query/fragment values.
+
+    A value without ``://`` is not automatically safe: a scheme-relative
+    (``//user:pw@host/v1``), one-slash (``http:/user:pw@host/v1``) or bare
+    userinfo (``user:pw@host/v1``) form still carries a password.  The old
+    early return leaked all three into the durable journal, and even a parsed
+    URL kept its fragment verbatim.
+    """
     raw = str(text)
-    if "://" not in raw:
-        return raw
     try:
         parsed = urllib.parse.urlsplit(raw)
     except ValueError:
-        # An unparsable URL still must not leak its credential-bearing parts.
-        without_fragment = raw.split("#", 1)[0]
-        head, _separator, _query = without_fragment.partition("?")
-        if "@" in head:
-            scheme, separator, remainder = head.partition("://")
-            return scheme + separator + "<redacted>@" + remainder.rsplit("@", 1)[-1]
-        return head
-    if not parsed.scheme or not parsed.netloc:
+        return (
+            _redact_url_textually(raw) if _looks_url_shaped(raw) else raw
+        )
+    if parsed.scheme and parsed.netloc:
+        netloc = parsed.netloc
+        if "@" in netloc:
+            netloc = "<redacted>@" + netloc.rsplit("@", 1)[-1]
+        query = _redact_query_component(parsed.query)
+        fragment = _redact_query_component(parsed.fragment)
+        return urllib.parse.urlunsplit(
+            (parsed.scheme, netloc, parsed.path, query, fragment)
+        )
+    if not _looks_url_shaped(raw):
         return raw
-    netloc = parsed.netloc
-    if "@" in netloc:
-        netloc = "<redacted>@" + netloc.rsplit("@", 1)[-1]
-    kept = [
-        (key, "<redacted>" if _credential_key(key) else value)
-        for key, value in _query_pairs(parsed.query)
-    ]
-    query = urllib.parse.urlencode(kept, doseq=True) if kept else ""
-    return urllib.parse.urlunsplit(
-        (parsed.scheme, netloc, parsed.path, query, parsed.fragment)
-    )
+    return _redact_url_textually(raw)
 
 
 def _redact_assignment_value(value: str) -> str:
@@ -567,7 +673,9 @@ class Diagnostic:
         # Agent/prose text can contain line breaks or terminal controls; a
         # diagnostic line and a commit-message bullet must stay one printable
         # line so embedded text cannot forge another diagnostic or section.
-        object.__setattr__(self, "operation", _one_line(self.operation))
+        object.__setattr__(
+            self, "operation", redact_text(_one_line(self.operation))
+        )
         object.__setattr__(self, "message", _one_line(self.message))
 
     @property
@@ -671,7 +779,11 @@ class RecoveryRecord:
                 setattr(self, name, [_one_line(value)] if value else [])
             else:
                 setattr(self, name, [_one_line(item) for item in (value or ())])
-        self.operation = _one_line(self.operation)
+        # ``operation`` reaches to_dict(), to_markdown() and the threshold-stop
+        # message, so it is redacted like every other free-text field.  The old
+        # ``_one_line``-only treatment persisted ``POST https://u:pw@...``
+        # verbatim in the durable journal.
+        self.operation = redact_text(_one_line(self.operation))
         for name in (
             "failure",
             "recovery_action",
@@ -1015,7 +1127,10 @@ class RecoveryJournal:
             for line in text.splitlines():
                 try:
                     entry = json.loads(line)
-                except ValueError:
+                except (ValueError, RecursionError):
+                    # A deeply nested line is malformed journal input, not a
+                    # reason to crash the reader; the documented contract is
+                    # to skip such lines.
                     continue
                 if not isinstance(entry, dict):
                     continue
@@ -1254,7 +1369,10 @@ class RecoveryJournal:
             for line in text.splitlines():
                 try:
                     entry = json.loads(line)
-                except ValueError:
+                except (ValueError, RecursionError):
+                    # A deeply nested line is malformed journal input, not a
+                    # reason to crash the reader; the documented contract is
+                    # to skip such lines.
                     continue
                 if isinstance(entry, dict):
                     event_id = str(entry.get("event_id") or "")
@@ -2139,11 +2257,14 @@ def render_run_markdown(
         "",
         "- Started: %s" % (started_at or "not recorded"),
         "- Finished: %s" % (finished_at or "not recorded"),
-        "- Command: `%s`" % (_one_line(command or "not recorded")),
+        "- Command: %s" % _inline_code(_one_line(command or "not recorded")),
     ]
     config = redact_value(dict(configuration or {}))
     if config:
-        lines.append("- Configuration: `%s`" % json.dumps(config, sort_keys=True))
+        lines.append(
+            "- Configuration: %s"
+            % _inline_code(json.dumps(config, sort_keys=True))
+        )
     lines.append("")
     if not items:
         lines.extend([empty_text, ""])

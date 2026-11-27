@@ -291,7 +291,9 @@ def _redacted(value: Any) -> Any:
         return text.rsplit("@", 1)[-1] if "@" in text else text
 
 
-_URL_PATTERN = re.compile(r"https?://[^\s'\"]+")
+_URL_PATTERN = re.compile(
+    r"(?i)(?:[A-Za-z][A-Za-z0-9+.\-]*://|(?<![\w:/])//)[^\s'\"]+"
+)
 
 
 def _redacted_text(text: str) -> str:

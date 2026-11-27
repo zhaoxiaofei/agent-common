@@ -642,20 +642,33 @@ class RedactionTests(unittest.TestCase):
             {"PAPER_QWEN_BASE_URL": "//user:pw@[bad/v1?api_key=SECRET"},
             clear=True,
         ):
-            claude_selection = model_runtime.resolve_agent_selection(
-                harness="claude-code", model="qwen38-27b"
-            )
-            claude = model_runtime.claude_environment(claude_selection)
-            codex_selection = model_runtime.resolve_agent_selection(
-                harness="gpt-codex", model="qwen38-27b"
-            )
-            argv = " ".join(model_runtime.codex_provider_args(codex_selection))
-            dsh_selection = model_runtime.resolve_agent_selection(
-                harness="dsh", model="qwen38-27b"
-            )
-            with self.assertRaises(model_runtime.ConfigError) as caught:
-                model_runtime.dsh_patch_text(dsh_selection)
-        for text in (claude["ANTHROPIC_BASE_URL"], argv, str(caught.exception)):
+            # F06: every route rejects the malformed base URL up front; the
+            # old tolerance branch exported it to the Codex/Claude child even
+            # though the DSH route already reported it as invalid.
+            selections = {
+                "claude-code": model_runtime.resolve_agent_selection(
+                    harness="claude-code", model="qwen38-27b"
+                ),
+                "gpt-codex": model_runtime.resolve_agent_selection(
+                    harness="gpt-codex", model="qwen38-27b"
+                ),
+                "dsh": model_runtime.resolve_agent_selection(
+                    harness="dsh", model="qwen38-27b"
+                ),
+            }
+            errors = []
+            for harness, selection in selections.items():
+                with self.assertRaises(
+                    model_runtime.ConfigError
+                ) as caught:
+                    if harness == "claude-code":
+                        model_runtime.claude_environment(selection)
+                    elif harness == "gpt-codex":
+                        model_runtime.codex_provider_args(selection)
+                    else:
+                        model_runtime.dsh_patch_text(selection)
+                errors.append(str(caught.exception))
+        for text in errors:
             self.assertNotIn("pw", text)
             self.assertNotIn("SECRET", text)
 
